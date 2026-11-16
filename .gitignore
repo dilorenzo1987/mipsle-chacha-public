@@ -1,0 +1,7 @@
+.tools/
+work/
+build/
+*.test
+*-mipsle
+gocache/
+gopath/

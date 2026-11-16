@@ -1,0 +1,224 @@
+// Copyright (c) 2026 netbrains.ch
+// SPDX-License-Identifier: BSD-3-Clause
+// Use of this source code is governed by the BSD-style license in the LICENSE file.
+
+//go:build gc && !purego
+
+#include "textflag.h"
+
+// Poly1305 block function for MIPS32r2 little-endian (e.g. MT7621 / 1004Kc).
+//
+// Radix 2^32 approach, inspired by OpenSSL's poly1305-mips.pl (32-bit path),
+// written from scratch.
+//
+// On mipsle, macState (h [3]uint64, r [2]uint64, s [2]uint64) is laid out in
+// memory as 32-bit little-endian words:
+//
+//	 0: h0  4: h1  8: h2  12: h3  16: h4  20: (high half of h[2], always 0)
+//	24: r0 28: r1 32: r2  36: r3  40..55: s (not used here)
+//
+// so h = h0 + h1*2^32 + h2*2^64 + h3*2^96 + h4*2^128 is used in place and
+// r = r0 + r1*2^32 + r2*2^64 + r3*2^96. Clamping gives r0 < 2^28 and
+// r1, r2, r3 < 2^28 with their low 2 bits cleared, so s_i = r_i + r_i>>2 =
+// 5*r_i/4 is exact. Since 2^128 = 5/4 mod 2^130-5, a product term
+// h_i*r_j*2^(32(i+j)) with i+j >= 4 equals h_i*s_j*2^(32(i+j-4)) mod p.
+//
+//	d0 = h0*r0 + h1*s3 + h2*s2 + h3*s1
+//	d1 = h0*r1 + h1*r0 + h2*s3 + h3*s2 + h4*s1
+//	d2 = h0*r2 + h1*r1 + h2*r0 + h3*s3 + h4*s2
+//	d3 = h0*r3 + h1*r2 + h2*r1 + h3*r0 + h4*s3
+//	d4 = h4*r0
+//
+// Each column is accumulated in HI:LO with MULTU/MADDU and is < 2^63, then
+// carries are propagated upwards (d4 += d3>>32 etc.). The bits of d4 above
+// 2^130 are folded back multiplied by 5: c5 = 5*(d4>>2) = (d4&~3) + (d4>>2),
+// h4 = d4&3.
+//
+// Lazy reduction: c5 is not propagated through h0..h4 at the end of each
+// block. It is kept in R25 and added together with the next message block
+// (h + c5 + m, carries up to 2 per limb). The value of h entering each
+// multiplication is therefore exactly the same as with a full propagation;
+// only the timing of the addition differs. The final c5 is propagated once
+// after the loop. On entry, the bits of h above 2^130 (h4>>2, at most 1
+// because h < 2p) are moved into c5 the same way. See NOTES.md for the bound
+// argument (h4 <= 6 before each multiplication, d4 < 10*2^28, c5 < 2^32).
+//
+// Register map:
+//	R1       padbit (1 for message blocks, 0 for a pre-padded final block)
+//	R2       msg pointer, R3 msg end
+//	R4..R8   h0..h4
+//	R9..R12  r0..r3
+//	R13..R15 s1..s3
+//	R25      c5 (pending fold, loop-carried); h4*r0 inside a block
+//	R16..R21, R24 temporaries
+// R23 (REGTMP) is not used; no instruction here expands to a sequence using it.
+//
+// Note on SGTU: "SGTU Ra, Rb, Rc" sets Rc = (Ra > Rb) unsigned. After
+// "ADDU Ra, Rb" (Rb += Ra), the carry out is (Ra > Rb).
+//
+// All branches depend only on the message length and alignment (public).
+
+// MADDU rs, rt: HI:LO += rs*rt (unsigned). Not supported by the Go assembler
+// (it only knows the signed MADD), so it is encoded by hand. WORD is a
+// scheduling barrier for the assembler, so it never reorders around it
+// (the Go mips assembler does no reordering anyway; it fills every branch
+// delay slot with a NOP).
+#define MADDU(rs, rt) WORD $(0x70000001 | ((rs)<<21) | ((rt)<<16))
+
+#define LOAD_ALIGNED \
+	MOVW	0(R2), R16 \
+	MOVW	4(R2), R17 \
+	MOVW	8(R2), R18 \
+	MOVW	12(R2), R19
+
+#define LOAD_UNALIGNED \
+	MOVWR	0(R2), R16 \
+	MOVWL	3(R2), R16 \
+	MOVWR	4(R2), R17 \
+	MOVWL	7(R2), R17 \
+	MOVWR	8(R2), R18 \
+	MOVWL	11(R2), R18 \
+	MOVWR	12(R2), R19 \
+	MOVWL	15(R2), R19
+
+// BLOCK: h = (h + c5 + m + padbit*2^128) * r, partially reduced, leaving the
+// new pending fold in R25. Message words in R16..R19.
+#define BLOCK \
+	ADDU	R16, R4 \
+	SGTU	R16, R4, R20 \
+	ADDU	R25, R4 \
+	SGTU	R25, R4, R21 \
+	ADDU	R21, R20 \
+	ADDU	R17, R5 \
+	SGTU	R17, R5, R21 \
+	ADDU	R20, R5 \
+	SGTU	R20, R5, R20 \
+	ADDU	R21, R20 \
+	ADDU	R18, R6 \
+	SGTU	R18, R6, R21 \
+	ADDU	R20, R6 \
+	SGTU	R20, R6, R20 \
+	ADDU	R21, R20 \
+	ADDU	R19, R7 \
+	SGTU	R19, R7, R21 \
+	ADDU	R20, R7 \
+	SGTU	R20, R7, R20 \
+	ADDU	R21, R20 \
+	ADDU	R20, R8 \
+	ADDU	R1, R8 \
+	MUL	R8, R9, R25 \
+	MULU	R4, R9 \
+	MADDU(5, 15) \
+	MADDU(6, 14) \
+	MADDU(7, 13) \
+	MOVW	LO, R16 \
+	MOVW	HI, R17 \
+	MULU	R4, R10 \
+	MADDU(5, 9) \
+	MADDU(6, 15) \
+	MADDU(7, 14) \
+	MADDU(8, 13) \
+	MOVW	LO, R18 \
+	MOVW	HI, R19 \
+	MULU	R4, R11 \
+	MADDU(5, 10) \
+	MADDU(6, 9) \
+	MADDU(7, 15) \
+	MADDU(8, 14) \
+	ADDU	R17, R18 \
+	SGTU	R17, R18, R20 \
+	ADDU	R20, R19 \
+	MOVW	LO, R21 \
+	MOVW	HI, R24 \
+	MULU	R4, R12 \
+	MADDU(5, 11) \
+	MADDU(6, 10) \
+	MADDU(7, 9) \
+	MADDU(8, 15) \
+	MOVW	R16, R4 \
+	MOVW	R18, R5 \
+	ADDU	R19, R21, R6 \
+	SGTU	R19, R6, R20 \
+	ADDU	R20, R24 \
+	MOVW	LO, R7 \
+	MOVW	HI, R8 \
+	ADDU	R24, R7 \
+	SGTU	R24, R7, R20 \
+	ADDU	R20, R8 \
+	ADDU	R25, R8 \
+	SRL	$2, R8, R24 \
+	SLL	$2, R24, R25 \
+	AND	$3, R8 \
+	ADDU	R24, R25
+
+// func updateBlocks(state *macState, msg []byte, padbit uint32)
+TEXT ·updateBlocks(SB), NOSPLIT, $0-20
+	MOVW	msg_base+4(FP), R2
+	MOVW	msg_len+8(FP), R3
+	MOVW	padbit+16(FP), R1
+	SRL	$4, R3
+	SLL	$4, R3
+	BEQ	R3, done
+	ADDU	R2, R3
+
+	MOVW	state+0(FP), R24
+	MOVW	0(R24), R4
+	MOVW	4(R24), R5
+	MOVW	8(R24), R6
+	MOVW	12(R24), R7
+	MOVW	16(R24), R8
+	MOVW	24(R24), R9
+	MOVW	28(R24), R10
+	MOVW	32(R24), R11
+	MOVW	36(R24), R12
+	SRL	$2, R10, R13
+	ADDU	R10, R13
+	SRL	$2, R11, R14
+	ADDU	R11, R14
+	SRL	$2, R12, R15
+	ADDU	R12, R15
+
+	// Initial pending fold: c5 = 5*(h4>>2), h4 &= 3.
+	SRL	$2, R8, R24
+	SLL	$2, R24, R25
+	ADDU	R24, R25
+	AND	$3, R8
+
+	AND	$3, R2, R16
+	BNE	R16, unaligned
+
+aligned:
+	LOAD_ALIGNED
+	ADDU	$16, R2
+	BLOCK
+	BNE	R2, R3, aligned
+	JMP	store
+
+unaligned:
+	LOAD_UNALIGNED
+	ADDU	$16, R2
+	BLOCK
+	BNE	R2, R3, unaligned
+
+store:
+	// Propagate the pending fold: h += c5.
+	ADDU	R25, R4
+	SGTU	R25, R4, R20
+	ADDU	R20, R5
+	SGTU	R20, R5, R20
+	ADDU	R20, R6
+	SGTU	R20, R6, R20
+	ADDU	R20, R7
+	SGTU	R20, R7, R20
+	ADDU	R20, R8
+
+	MOVW	state+0(FP), R24
+	MOVW	R4, 0(R24)
+	MOVW	R5, 4(R24)
+	MOVW	R6, 8(R24)
+	MOVW	R7, 12(R24)
+	MOVW	R8, 16(R24)
+	MOVW	R0, 20(R24)
+
+done:
+	RET
