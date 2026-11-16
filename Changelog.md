@@ -12,3 +12,4 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   standard library's vendored copy (used by `crypto/tls`).
 - `scripts/apply-overlay.sh`, `scripts/mango-swap.sh` (install on the router with automatic rollback).
 - `bench/main.go` crypto micro-benchmark and results for the GL.iNet GL-MG1300 (`results/`).
+- `scripts/setup-tools.sh`: downloads and checksum-verifies the Go toolchain into `.tools/go`.

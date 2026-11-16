@@ -1,0 +1,9 @@
+mipsle-chacha
+Copyright (c) 2026 netbrains.ch
+
+The files in overlay/ are designed to be dropped into golang.org/x/crypto and
+the Go standard library's vendored copy of it, which are Copyright The Go
+Authors and licensed under the BSD 3-Clause license. The build script fetches
+Tailscale (BSD 3-Clause, Copyright Tailscale Inc & contributors) and applies a
+patch from admonstrator/glinet-tailscale-updater; those are not part of this
+repository.

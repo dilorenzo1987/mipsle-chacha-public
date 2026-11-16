@@ -70,7 +70,7 @@ The output had the same sha256 as the unpacked reference, `a12877d7…b54b`.
 ## How to build
 
 Requirements: Git Bash (or any bash with git, patch, sha256sum) and the Go 1.27.4
-toolchain in `.tools/go`. The first run clones the repos and downloads modules,
+toolchain in `.tools/go` (`scripts/setup-tools.sh` downloads and verifies it). The first run clones the repos and downloads modules,
 so it needs network access. Later runs reuse the caches in `work/`.
 
 Runs share state in `work/`. Every run, including `--check`, hard-resets
