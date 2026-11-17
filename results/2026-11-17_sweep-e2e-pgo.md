@@ -67,9 +67,33 @@ tailscaled used on average 1.6 of the 4 hardware threads.
 
 The build pipeline uses this profile (`pgo/2026-11-16_A_mixed90s.pprof`) for profile-guided optimization by
 default (`--no-pgo` turns it off; baseline builds never use it, so they still reproduce admonstrator's release
-byte for byte). The PGO build was a little better in every comparison above (DERP 11.5 / 11.3 vs 11.3 / 11.1 /
-10.35 Mbit/s; 2–6 % less CPU per MB on the direct paths), likely a real gain of a few percent, but not
-provable against the round-to-round spread. The binary is 65 KB smaller (27,001,023 vs 27,066,559 bytes).
+byte for byte). The PGO build looked a little better in every comparison above (DERP 11.5 / 11.3 vs 11.3 /
+11.1 / 10.35 Mbit/s), but a closer look (next section) puts the gain at about 0–1 %: harmless, kept as the
+default, but not a measurable improvement. The binary is 65 KB smaller (27,001,023 vs 27,066,559 bytes).
+
+## Follow-up (2026-11-17): where the round-to-round spread comes from
+
+DERP download only, warm-up run discarded, builds interleaved (each segment = install + restart, then 4 runs):
+
+- Within one running process, runs agree to about 1 % (10 back-to-back runs: 10.0 Mbit/s ± 0.5 %).
+- In every measurement on both days, Mbit/s × CPU-s/MB ≈ 18: tailscaled always uses about 2.25 CPUs. The
+  DERP path is CPU-bound; throughput is that CPU budget divided by the CPU cost per MB.
+- The CPU cost per MB is fixed for the life of a tailscaled process but differs from one start to the next
+  (1.53–1.80 CPU-s/MB across all starts, independent of the build). That is the whole spread.
+- Compared at a similar cost level, PGO and the plain build differ by about 0–1 %.
+
+| segment | build | Mbit/s | CPU-s/MB |
+|---|---|---|---|
+| 1 | plain | 9.99 | 1.80 |
+| 2 | PGO | 10.90 | 1.66 |
+| 3 | plain | 10.92 | 1.66 |
+| 4 | PGO | 10.84 | 1.65 |
+| 5 | plain | 10.20 | 1.78 |
+| 6 | PGO | 10.98 | 1.62 |
+
+The "lost samples inside emulated 64-bit atomics" bucket above (6 %) is Go's single process-wide spinlock for
+64-bit atomic operations on 32-bit MIPS (no 64-bit LL/SC): on this CPU one such operation costs ~265 ns, and
+operations on unrelated variables from different threads serialize on that one lock.
 
 Installed: `1.104.7-tiny.mipsle-chacha.2a-pgo`, sha256
 `9cccfa2a100caba53b4b62edc0f6328fa2287ace128f23f864a5eb6e35b112eb`, reproducible with

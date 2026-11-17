@@ -202,8 +202,10 @@ Measured on a GL-MG1300 on 2026-11-16 (details: `results/2026-11-16_gl-mg1300.md
   Poly1305 about 13 % and ChaCha20-Poly1305 about 2–4 % faster in micro-benchmarks. End to end on the
   router the difference is within the run-to-run spread: crypto is now only about 8 % of tailscaled's
   CPU time, most of the rest is kernel work (TUN writes) and Tailscale's packet handling. Overlay builds
-  now also use profile-guided optimization from a CPU profile recorded on the router: slightly better in
-  every comparison, but also within the spread. Details: `results/2026-11-17_sweep-e2e-pgo.md`.
+  now also use profile-guided optimization from a CPU profile recorded on the router; its effect is about
+  0–1 %, i.e. not measurable. The spread itself comes from tailscaled: each process start lands on a
+  different CPU cost per MB (up to ~15 % apart) and the DERP path is CPU-bound. Details:
+  `results/2026-11-17_sweep-e2e-pgo.md`.
 
 ## License
 
