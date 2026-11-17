@@ -40,27 +40,34 @@
 #define C2 $0x79622d32
 #define C3 $0x6b206574
 
-// Aligned word load/store.
-#define LDA(off, r) MOVW off(R18), r
-#define STA(r, off) MOVW r, off(R17)
-// Unaligned word load/store (little endian).
-#define LDU(off, r) MOVWR off(R18), r; MOVWL off+3(R18), r
+// Unaligned word store (little endian).
 #define STU(r, off) MOVWR r, off(R17); MOVWL r, off+3(R17)
 
-// Feed-forward of a constant word.
-#define FFC(LD, ST, x, k, off) \
-	LD(off, R24); ADDU k, x; XOR R24, x; ST(x, off)
-// Feed-forward of a word from the state.
-#define FFS(LD, ST, x, soff, off) \
-	MOVW soff(R20), R21; LD(off, R24); ADDU R21, x; XOR R24, x; ST(x, off)
+// Feed-forward: out[off] = in[off] ^ (x + k), for two constant words at a
+// time (k, j are the constants C0..C3) and for one word from the state
+// (soff). The instruction order keeps every loaded value at least one
+// instruction away from its first use and, on the unaligned path, never puts
+// an LWL right after the LWR into the same register (both stall on the
+// 1004Kc). src and dst are identical or disjoint (XORKeyStream panics on
+// inexact overlap), so loading a word before storing it is enough.
+#define FFC2A(x, k, off, y, j, yoff) \
+	MOVW off(R18), R24; MOVW yoff(R18), R21; ADDU k, x; ADDU j, y; \
+	XOR R24, x; MOVW x, off(R17); XOR R21, y; MOVW y, yoff(R17)
+#define FFC2U(x, k, off, y, j, yoff) \
+	MOVWR off(R18), R24; MOVWR yoff(R18), R21; ADDU k, x; MOVWL off+3(R18), R24; \
+	ADDU j, y; MOVWL yoff+3(R18), R21; XOR R24, x; STU(x, off); XOR R21, y; STU(y, yoff)
+#define FFSA(x, soff, off) \
+	MOVW soff(R20), R21; MOVW off(R18), R24; ADDU R21, x; XOR R24, x; MOVW x, off(R17)
+#define FFSU(x, soff, off) \
+	MOVWR off(R18), R24; MOVW soff(R20), R21; MOVWL off+3(R18), R24; ADDU R21, x; \
+	XOR R24, x; STU(x, off)
 
-#define FINISH(LD, ST) \
-	FFC(LD, ST, R1, C0, 0); FFC(LD, ST, R2, C1, 4); \
-	FFC(LD, ST, R3, C2, 8); FFC(LD, ST, R4, C3, 12); \
-	FFS(LD, ST, R5, 0, 16); FFS(LD, ST, R6, 4, 20); FFS(LD, ST, R7, 8, 24); FFS(LD, ST, R8, 12, 28); \
-	FFS(LD, ST, R9, 16, 32); FFS(LD, ST, R10, 20, 36); FFS(LD, ST, R11, 24, 40); FFS(LD, ST, R12, 28, 44); \
-	FFS(LD, ST, R13, 32, 48); \
-	FFS(LD, ST, R14, 36, 52); FFS(LD, ST, R15, 40, 56); FFS(LD, ST, R16, 44, 60)
+#define FINISH(FC2, FS) \
+	FC2(R1, C0, 0, R2, C1, 4); FC2(R3, C2, 8, R4, C3, 12); \
+	FS(R5, 0, 16); FS(R6, 4, 20); FS(R7, 8, 24); FS(R8, 12, 28); \
+	FS(R9, 16, 32); FS(R10, 20, 36); FS(R11, 24, 40); FS(R12, 28, 44); \
+	FS(R13, 32, 48); \
+	FS(R14, 36, 52); FS(R15, 40, 56); FS(R16, 44, 60)
 
 // func xorKeyStreamMIPS(dst, src *byte, n int, state *[8]uint32)
 TEXT ·xorKeyStreamMIPS(SB), NOSPLIT, $48-16
@@ -101,7 +108,7 @@ loop:
 	DROUND; DROUND; DROUND
 
 	BNE	R25, unaligned
-	FINISH(LDA, STA)
+	FINISH(FFC2A, FFSA)
 next:
 	MOVW	32(R20), R21
 	ADDU	$64, R17
@@ -114,5 +121,5 @@ done:
 	RET
 
 unaligned:
-	FINISH(LDU, STU)
+	FINISH(FFC2U, FFSU)
 	JMP	next

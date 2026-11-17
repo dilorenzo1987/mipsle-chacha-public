@@ -224,6 +224,40 @@ func TestMipsleWorstCase(t *testing.T) {
 	}
 }
 
+// TestMipsleExitCarry drives the carry chain that propagates the last c5
+// after the loop through each limb in turn. With r = 1 the multiplication is
+// the identity (s1..s3 = 0), so the state after the block is chosen exactly:
+// h = 7*2^128 gives c5 = 5 on entry, the block (0xfffffff9, k words
+// 0xffffffff, then 0) plus padbit gives h0 = 0xfffffffe and h4 = 4, so the
+// final fold yields c5 = 5 again and h0 + c5 carries through exactly k
+// all-ones limbs. Random inputs essentially never hit this (a deletion
+// mutant of the h2 -> h3 carry survived all other tests).
+func TestMipsleExitCarry(t *testing.T) {
+	var key [32]byte
+	key[0] = 1 // r = 1
+	for k := 0; k <= 3; k++ {
+		msg := make([]byte, 16)
+		binary.LittleEndian.PutUint32(msg[0:], 0xfffffff9)
+		for i := 1; i <= k; i++ {
+			binary.LittleEndian.PutUint32(msg[4*i:], 0xffffffff)
+		}
+		for _, unaligned := range []bool{false, true} {
+			m := msg
+			if unaligned {
+				m = unalignBytes(msg)
+			}
+			var a macState
+			initialize(&key, &a)
+			a.h = bigToH(new(big.Int).Mul(big.NewInt(7), big2128))
+			g := a
+			model := bigUpdate(new(big.Int).Mod(hToBig(a.h), bigP), rToBig(a.r), m)
+			update(&a, m)
+			updateGeneric(&g, m)
+			checkState(t, fmt.Sprintf("exit carry k=%d unaligned=%v", k, unaligned), &a, &g, model)
+		}
+	}
+}
+
 // testRNG returns a deterministic RNG, or a time-seeded one with -stress.
 // iters is scaled up with -stress and down with -short.
 func testRNG(t *testing.T, seed int64, iters int) (*rand.Rand, int) {

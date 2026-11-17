@@ -20,6 +20,11 @@
 #   --suffix S           version suffix (default: -tiny.mipsle-chacha / -tiny.mipsle-base)
 #   --variant NAME       output name build/tailscaled-mipsle-NAME
 #   --ref BIN            diff `go version -m` of the result against BIN
+#   --pgo FILE           profile-guided optimization with this CPU profile instead of
+#                        the default (overlay builds use pgo/2026-11-16_A_mixed90s.pprof,
+#                        a 90 s CPU profile of tailscaled on the router under traffic)
+#   --no-pgo             overlay build without PGO (baseline builds never use PGO,
+#                        so --no-overlay still reproduces admon's build exactly)
 #   -h | --help
 #
 # Everything mutable lives in work/ (cached between runs) and build/ (outputs).
@@ -68,6 +73,7 @@ CHECK=false
 SUFFIX=""
 VARIANT=""
 REF=""
+PGO=""
 
 die()  { printf 'build-tailscaled: ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '==> %s\n' "$*"; }
@@ -80,16 +86,20 @@ while [ $# -gt 0 ]; do
         --suffix)      SUFFIX=$2; shift 2 ;;
         --variant)     VARIANT=$2; shift 2 ;;
         --ref)         REF=$2; shift 2 ;;
-        -h|--help)     sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --pgo)         PGO=$(CDPATH='' cd -- "$(dirname -- "$2")" && pwd)/$(basename -- "$2"); shift 2 ;;
+        --no-pgo)      PGO=none; shift ;;
+        -h|--help)     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
 
 if [ "$OVERLAY" = true ]; then
     : "${SUFFIX:=-tiny.mipsle-chacha}"; : "${VARIANT:=chacha}"
+    : "${PGO:=$ROOT/pgo/2026-11-16_A_mixed90s.pprof}"
 else
     : "${SUFFIX:=-tiny.mipsle-base}";   : "${VARIANT:=baseline}"
 fi
+[ "$PGO" != none ] || PGO=""
 
 # Native (C:/...) path for arguments handed to go.exe on Windows; identity elsewhere.
 native() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }
@@ -269,8 +279,9 @@ OUT="$BUILD/tailscaled-mipsle-$VARIANT"
 note "building $OUT"
 rm -f "$OUT"
 start=$(date +%s)
+[ -z "$PGO" ] || { [ -f "$PGO" ] || die "PGO profile not found: $PGO"; note "PGO profile: $PGO"; }
 (cd "$TS_DIR" && target_env "$GO" build ${MODFLAG:+"$MODFLAG"} -tags="$TAGS" -trimpath \
-    -ldflags "$LDFLAGS" -o "$(native "$OUT")" tailscale.com/cmd/tailscaled)
+    ${PGO:+-pgo="$(native "$PGO")"} -ldflags "$LDFLAGS" -o "$(native "$OUT")" tailscale.com/cmd/tailscaled)
 note "build took $(( $(date +%s) - start ))s"
 
 size=$(wc -c <"$OUT" | tr -d ' ')

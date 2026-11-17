@@ -29,19 +29,24 @@
 //	d3 = h0*r3 + h1*r2 + h2*r1 + h3*r0 + h4*s3
 //	d4 = h4*r0
 //
-// Each column is accumulated in HI:LO with MULTU/MADDU and is < 2^63, then
-// carries are propagated upwards (d4 += d3>>32 etc.). The bits of d4 above
+// Each column is accumulated in HI:LO with MULTU/MADDU. The carry of column
+// i (its HI word, < 2^31) is added into column i+1 inside the accumulator as
+// the last product (MADDU hi, 1 with R21 = 1), so LO of each column is the
+// final limb and no ALU carry chain is needed; every column including the
+// carry-in stays < 2^63. d4 = HI of column 3 + h4*r0. The bits of d4 above
 // 2^130 are folded back multiplied by 5: c5 = 5*(d4>>2) = (d4&~3) + (d4>>2),
 // h4 = d4&3.
 //
-// Lazy reduction: c5 is not propagated through h0..h4 at the end of each
-// block. It is kept in R25 and added together with the next message block
-// (h + c5 + m, carries up to 2 per limb). The value of h entering each
-// multiplication is therefore exactly the same as with a full propagation;
-// only the timing of the addition differs. The final c5 is propagated once
-// after the loop. On entry, the bits of h above 2^130 (h4>>2, at most 1
-// because h < 2p) are moved into c5 the same way. See NOTES.md for the bound
-// argument (h4 <= 6 before each multiplication, d4 < 10*2^28, c5 < 2^32).
+// Lazy reduction: d4 is left in R24 (HI of column 3) + R25 (h4*r0) at the
+// end of a block. The fold is done at the start of the next block, and c5 is
+// added together with the next message block (h + c5 + m, carries up to 2
+// per limb). The value of h entering each multiplication is therefore
+// exactly the same as with a full propagation; only the timing differs. On
+// entry R24 = 0 and R25 = stored h4, so the first fold moves the bits of h
+// above 2^130 (h4>>2, at most 1 because h < 2p) into c5 the same way. After
+// the loop the pending d4 is folded and c5 propagated once. See NOTES.md for
+// the bound argument (h4 <= 6 before each multiplication, d4 < 10*2^28,
+// c5 < 2^32).
 //
 // Register map:
 //	R1       padbit (1 for message blocks, 0 for a pre-padded final block)
@@ -49,12 +54,20 @@
 //	R4..R8   h0..h4
 //	R9..R12  r0..r3
 //	R13..R15 s1..s3
-//	R25      c5 (pending fold, loop-carried); h4*r0 inside a block
-//	R16..R21, R24 temporaries
+//	R16..R19 message words, then h + c5 + m (the multiplication inputs)
+//	R20      carry temporary
+//	R21      constant 1
+//	R24      HI of the previous column (carry-in); temporary in the fold
+//	R25      h4*r0 -> d4 -> c5 (loop-carried with R24)
 // R23 (REGTMP) is not used; no instruction here expands to a sequence using it.
 //
 // Note on SGTU: "SGTU Ra, Rb, Rc" sets Rc = (Ra > Rb) unsigned. After
 // "ADDU Ra, Rb" (Rb += Ra), the carry out is (Ra > Rb).
+//
+// Scheduling (measured on the MT7621): MFHI/MFLO results are consumed >= 5
+// instructions later, MUL (which leaves HI/LO unpredictable before MIPS32r6)
+// sits where HI/LO are dead, and the unaligned loads put the 4 LWR before the
+// 4 LWL (an LWL right after the LWR into the same register stalls).
 //
 // All branches depend only on the message length and alignment (public).
 
@@ -73,83 +86,80 @@
 
 #define LOAD_UNALIGNED \
 	MOVWR	0(R2), R16 \
-	MOVWL	3(R2), R16 \
 	MOVWR	4(R2), R17 \
-	MOVWL	7(R2), R17 \
 	MOVWR	8(R2), R18 \
-	MOVWL	11(R2), R18 \
 	MOVWR	12(R2), R19 \
+	MOVWL	3(R2), R16 \
+	MOVWL	7(R2), R17 \
+	MOVWL	11(R2), R18 \
 	MOVWL	15(R2), R19
 
-// BLOCK: h = (h + c5 + m + padbit*2^128) * r, partially reduced, leaving the
-// new pending fold in R25. Message words in R16..R19.
+// FOLD: d4 = R24 + R25; h4 = d4&3 (R8), c5 = (d4&~3) + (d4>>2) (R25).
+#define FOLD \
+	ADDU	R24, R25 \
+	SRL	$2, R25, R24 \
+	AND	$3, R25, R8 \
+	SUBU	R8, R25 \
+	ADDU	R24, R25
+
+// BLOCK: fold the pending d4, then h = (h + c5 + m + padbit*2^128) * r,
+// partially reduced, leaving the new pending d4 in R24 + R25. Message words
+// in R16..R19.
 #define BLOCK \
-	ADDU	R16, R4 \
-	SGTU	R16, R4, R20 \
-	ADDU	R25, R4 \
-	SGTU	R25, R4, R21 \
-	ADDU	R21, R20 \
-	ADDU	R17, R5 \
-	SGTU	R17, R5, R21 \
-	ADDU	R20, R5 \
-	SGTU	R20, R5, R20 \
-	ADDU	R21, R20 \
-	ADDU	R18, R6 \
-	SGTU	R18, R6, R21 \
-	ADDU	R20, R6 \
-	SGTU	R20, R6, R20 \
-	ADDU	R21, R20 \
-	ADDU	R19, R7 \
-	SGTU	R19, R7, R21 \
-	ADDU	R20, R7 \
-	SGTU	R20, R7, R20 \
-	ADDU	R21, R20 \
+	FOLD \
+	ADDU	R4, R16 \
+	SGTU	R4, R16, R20 \
+	ADDU	R25, R16 \
+	SGTU	R25, R16, R24 \
+	ADDU	R5, R17 \
+	ADDU	R24, R20 \
+	SGTU	R5, R17, R24 \
+	ADDU	R20, R17 \
+	SGTU	R20, R17, R20 \
+	ADDU	R6, R18 \
+	ADDU	R24, R20 \
+	SGTU	R6, R18, R24 \
+	ADDU	R20, R18 \
+	SGTU	R20, R18, R20 \
+	ADDU	R7, R19 \
+	ADDU	R24, R20 \
+	SGTU	R7, R19, R24 \
+	ADDU	R20, R19 \
+	SGTU	R20, R19, R20 \
+	ADDU	R24, R20 \
 	ADDU	R20, R8 \
 	ADDU	R1, R8 \
-	MUL	R8, R9, R25 \
-	MULU	R4, R9 \
-	MADDU(5, 15) \
-	MADDU(6, 14) \
-	MADDU(7, 13) \
-	MOVW	LO, R16 \
-	MOVW	HI, R17 \
-	MULU	R4, R10 \
-	MADDU(5, 9) \
-	MADDU(6, 15) \
-	MADDU(7, 14) \
-	MADDU(8, 13) \
-	MOVW	LO, R18 \
-	MOVW	HI, R19 \
-	MULU	R4, R11 \
-	MADDU(5, 10) \
-	MADDU(6, 9) \
-	MADDU(7, 15) \
-	MADDU(8, 14) \
-	ADDU	R17, R18 \
-	SGTU	R17, R18, R20 \
-	ADDU	R20, R19 \
-	MOVW	LO, R21 \
+	MULU	R16, R9 \
+	MADDU(17, 15) \
+	MADDU(18, 14) \
+	MADDU(19, 13) \
 	MOVW	HI, R24 \
-	MULU	R4, R12 \
-	MADDU(5, 11) \
-	MADDU(6, 10) \
-	MADDU(7, 9) \
+	MOVW	LO, R4 \
+	MULU	R16, R10 \
+	MADDU(17, 9) \
+	MADDU(18, 15) \
+	MADDU(19, 14) \
+	MADDU(8, 13) \
+	MADDU(24, 21) \
+	MOVW	HI, R24 \
+	MOVW	LO, R5 \
+	MULU	R16, R11 \
+	MADDU(17, 10) \
+	MADDU(18, 9) \
+	MADDU(19, 15) \
+	MADDU(8, 14) \
+	MADDU(24, 21) \
+	MOVW	HI, R24 \
+	MOVW	LO, R6 \
+	MUL	R8, R9, R25 \
+	MULU	R16, R12 \
+	MADDU(17, 11) \
+	MADDU(18, 10) \
+	MADDU(19, 9) \
 	MADDU(8, 15) \
-	MOVW	R16, R4 \
-	MOVW	R18, R5 \
-	ADDU	R19, R21, R6 \
-	SGTU	R19, R6, R20 \
-	ADDU	R20, R24 \
-	MOVW	LO, R7 \
-	MOVW	HI, R8 \
-	ADDU	R24, R7 \
-	SGTU	R24, R7, R20 \
-	ADDU	R20, R8 \
-	ADDU	R25, R8 \
-	SRL	$2, R8, R24 \
-	SLL	$2, R24, R25 \
-	AND	$3, R8 \
-	ADDU	R24, R25
+	MADDU(24, 21) \
+	MOVW	HI, R24 \
+	MOVW	LO, R7
 
 // func updateBlocks(state *macState, msg []byte, padbit uint32)
 TEXT ·updateBlocks(SB), NOSPLIT, $0-20
@@ -161,28 +171,24 @@ TEXT ·updateBlocks(SB), NOSPLIT, $0-20
 	BEQ	R3, done
 	ADDU	R2, R3
 
-	MOVW	state+0(FP), R24
-	MOVW	0(R24), R4
-	MOVW	4(R24), R5
-	MOVW	8(R24), R6
-	MOVW	12(R24), R7
-	MOVW	16(R24), R8
-	MOVW	24(R24), R9
-	MOVW	28(R24), R10
-	MOVW	32(R24), R11
-	MOVW	36(R24), R12
+	MOVW	state+0(FP), R20
+	MOVW	0(R20), R4
+	MOVW	4(R20), R5
+	MOVW	8(R20), R6
+	MOVW	12(R20), R7
+	MOVW	16(R20), R25
+	MOVW	24(R20), R9
+	MOVW	28(R20), R10
+	MOVW	32(R20), R11
+	MOVW	36(R20), R12
+	MOVW	$0, R24
+	MOVW	$1, R21
 	SRL	$2, R10, R13
 	ADDU	R10, R13
 	SRL	$2, R11, R14
 	ADDU	R11, R14
 	SRL	$2, R12, R15
 	ADDU	R12, R15
-
-	// Initial pending fold: c5 = 5*(h4>>2), h4 &= 3.
-	SRL	$2, R8, R24
-	SLL	$2, R24, R25
-	ADDU	R24, R25
-	AND	$3, R8
 
 	AND	$3, R2, R16
 	BNE	R16, unaligned
@@ -201,7 +207,8 @@ unaligned:
 	BNE	R2, R3, unaligned
 
 store:
-	// Propagate the pending fold: h += c5.
+	// Fold the pending d4 and propagate c5 once: h += c5.
+	FOLD
 	ADDU	R25, R4
 	SGTU	R25, R4, R20
 	ADDU	R20, R5

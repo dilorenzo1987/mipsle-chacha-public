@@ -13,14 +13,21 @@ to v0.58.0). Build tags: `gc && !purego`, plus the `_mipsle` file suffix.
 - The 10 double rounds are fully unrolled; one round body serves both the
   aligned and the unaligned path. The path is picked per call
   (`(src|dst)&3`) and only the feed-forward differs: `LW/SW` vs
-  `LWR/LWL` + `SWR/SWL`.
+  `LWR/LWL` + `SWR/SWL`. A variant with two complete loops (8.7 KB instead
+  of 4.9 KB) was ~1 % faster in micro-benchmarks but not measurably better in
+  tailscaled (see below), so the smaller single loop was kept.
 - The 3 counter-independent quarter rounds of the first column round are
   computed once per call and kept in a 48-byte stack frame (the asm does not
   use `Cipher.p1..p15`/`precompDone`, so it only depends on the
   key/counter/nonce layout).
-- About 1030 instructions per block; measured ~1070 cycles per block on
-  4 KB inputs, i.e. close to 1 instruction per cycle. The rest is mostly
-  adds/xors/rotates, so there is little left to gain by rescheduling.
+- Feed-forward ordering (2026-11-16): the two constant words are handled in
+  pairs with both loads first, and on the unaligned path no LWL directly
+  follows the LWR into the same register (measured to stall on the 1004Kc);
+  every loaded word is used at least one instruction later. Same instruction
+  count as before (1034 per block aligned, 1068 unaligned).
+- The quarter rounds are 924 of those instructions (12 per QR with ROTR, the
+  minimum on MIPS32r2), so measured ~1070 cycles per block is close to
+  1 instruction per cycle and little is left.
 
 ### Register map
 | Reg | Use |
@@ -88,3 +95,20 @@ The seal figure uses the unmodified pure-Go poly1305, which now dominates;
 OpenSSL's ChaCha20-Poly1305 does 213 Mbit/s.
 Benchmark numbers vary by roughly ±3% between runs, and one run dropped to
 ~250 Mbit/s, probably because of other load on the device.
+
+## Considered, not kept (2026-11-16)
+- **Two separate loops, counter in R25, constants and C0+key[0] on the stack** (the sweep's "B"):
+  1023/1055 instructions per block instead of 1034/1068, and in micro-benchmarks 1.4 % / 2.4 % faster
+  (streaming) and 0.5–1 % on seal/open; against the kept version (single loop with the feed-forward
+  reorder) only ~1 %. Installed in tailscaled and measured end to end (`results/2026-11-17_sweep-e2e-pgo.md`): 10.7–10.9 Mbit/s on
+  DERP vs 10.35–11.3 for the kept version, i.e. not separable. Not kept: no measurable end-to-end benefit
+  for twice the code (4.9 → 8.7 KB; on the DERP path both loops are hot for every packet).
+- **Cache the first round in `Cipher.p1..p15` + 4 more precomputed diagonal-round steps**:
+  built and verified (all tests plus a cache test and two mutants on the device), 1019/1051 instructions per
+  block. A/B vs the two-loop version above (then committed), interleaved: ChaCha20 streaming with one reused cipher −1.7 % aligned
+  (8/8 pairs), but seal/open of 1420-byte packets ±0.5 % (4–7 of 12 pairs faster), 64-byte open −1.0 %
+  (12/12), 64-byte seal unchanged; an unchanged Poly1305 control drifted by 2 % in the same runs. The AEAD
+  creates a new Cipher per packet, so the cache only helps within one packet's three calls. Not consistently
+  faster on the paths Tailscale uses, and it would tie the asm to 13 more field offsets: rejected.
+- **Hand-encoded branches to fill delay slots:** ~0.1 %, offsets must be recomputed by hand after every edit.
+- **The two-loop version using R22/R28 as extra registers:** same gain as the two-loop version, more risk.

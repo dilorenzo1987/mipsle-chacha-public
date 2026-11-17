@@ -29,7 +29,9 @@ refute this. This project:
 | `overlay/poly1305/` | `sum_mipsle.go`, `sum_mipsle.s`, tests, `NOTES.md` |
 | `scripts/apply-overlay.sh` | Copies the overlay into an x/crypto tree and/or a GOROOT's vendored x/crypto |
 | `scripts/build-tailscaled.sh` | The build pipeline (baseline or overlay) |
-| `bench/` | Throughput benchmark (1420-byte packets) |
+| `bench/` | Throughput benchmark (1420-byte packets); `bench/sweep` for interleaved A/B runs |
+| `pgo/` | CPU profile of tailscaled on the router, used for profile-guided optimization of overlay builds |
+| `results/` | Measured results |
 | `.tools/go/` | Go 1.27.4 toolchain, never modified (gitignored) |
 | `work/` | Caches: Tailscale checkout, admon repo, patched GOROOT, patched x/crypto, GOPATH, GOCACHE (gitignored) |
 | `build/` | Build outputs (gitignored) |
@@ -78,7 +80,7 @@ Runs share state in `work/`. Every run, including `--check`, hard-resets
 
 ```sh
 scripts/build-tailscaled.sh --no-overlay   # baseline -> build/tailscaled-mipsle-baseline
-scripts/build-tailscaled.sh                # overlay  -> build/tailscaled-mipsle-chacha
+scripts/build-tailscaled.sh                # overlay + PGO -> build/tailscaled-mipsle-chacha
 scripts/build-tailscaled.sh --check        # show what gets compiled; no build
 ```
 
@@ -92,6 +94,8 @@ Options:
 | `--suffix S` | Version suffix. Defaults: `-tiny.mipsle-chacha` (overlay), `-tiny.mipsle-base` (baseline) |
 | `--variant NAME` | Output file `build/tailscaled-mipsle-NAME` |
 | `--ref BIN` | Diff `go version -m` of the result against a reference binary |
+| `--no-pgo` | Overlay build without profile-guided optimization. Overlay builds use `pgo/2026-11-16_A_mixed90s.pprof` by default; baseline builds never use PGO |
+| `--pgo FILE` | Use a different CPU profile for PGO (e.g. one recorded with `tailscale debug --cpu-profile` on a newer version) |
 
 Each run:
 
@@ -183,10 +187,17 @@ Measured on a GL-MG1300 on 2026-11-16 (details: `results/2026-11-16_gl-mg1300.md
   unrolled rounds, counter-independent first-round quarter rounds precomputed per call, aligned and
   LWL/LWR paths, bufSize 64. Design and register map: `overlay/chacha20/NOTES.md`.
 - Poly1305 (`overlay/poly1305/`): radix 2^32 in place on the generic `macState`, MULTU/MADDU
-  (MADDU hand-encoded), lazy carry fold; bound proof in `overlay/poly1305/NOTES.md`.
+  (MADDU hand-encoded), column carries added in the accumulator, lazy carry fold; bound proof in
+  `overlay/poly1305/NOTES.md`.
 - Verification: upstream test vectors, differential tests against the generic Go code (and a
-  math/big model for Poly1305), 300k-iteration soak, 19 single-instruction mutants all caught;
-  all run on the device.
+  math/big model for Poly1305), 300k-iteration soak, single-instruction mutants (19 on the first
+  version, 41 on the current block) all caught; all run on the device.
+- The overlay in this repository is newer than the build measured above: a later tuning pass made
+  Poly1305 about 13 % and ChaCha20-Poly1305 about 2–4 % faster in micro-benchmarks. End to end on the
+  router the difference is within the run-to-run spread: crypto is now only about 8 % of tailscaled's
+  CPU time, most of the rest is kernel work (TUN writes) and Tailscale's packet handling. Overlay builds
+  now also use profile-guided optimization from a CPU profile recorded on the router: slightly better in
+  every comparison, but also within the spread. Details: `results/2026-11-17_sweep-e2e-pgo.md`.
 
 ## License
 

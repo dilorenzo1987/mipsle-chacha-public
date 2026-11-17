@@ -36,21 +36,35 @@ h_i*s_j*2^(32(i+j-4)) mod p:
     d4 = h4*r0
 
 That is 19 32x32->64 products (MULTU + MADDU into HI:LO) plus one 32-bit MUL
-(h4*r0) per 16-byte block. Then carries are propagated d0 -> d1 -> d2 -> d3 -> d4
-(d_{i+1} += d_i >> 32), and the part of d4 above 2^130 is folded back:
+(h4*r0) per 16-byte block. Carries are propagated d0 -> d1 -> d2 -> d3 -> d4
+(d_{i+1} += d_i >> 32) **inside the accumulator**: the HI word of column i is
+added to column i+1 as one more product, `MADDU hi, 1` (R21 = 1), so the LO
+of each column is already the final limb and no ALU carry chain is needed.
+d4 = HI(column 3) + h4*r0. The part of d4 above 2^130 is folded back:
 c5 = 5*(d4>>2) = (d4 & ~3) + (d4 >> 2), h4 = d4 & 3.
 
-**Lazy fold.** c5 is not propagated through h0..h4 at the end of every block.
-It stays in a register and is added together with the next message block
-(h + c5 + m, with per-limb carries of up to 2). The value entering each
-multiplication is exactly what a full propagation would give, so the bounds
-below are unchanged. The last c5 is propagated once after the loop. On entry,
-the bits of the stored h above 2^130 are turned into the initial c5 the same
-way (c5 = 5*(h4>>2), h4 &= 3).
+**Lazy fold.** Neither the fold nor c5 is applied at the end of a block. d4 is
+left as R24 (HI of column 3) + R25 (h4*r0); the next block starts with the
+fold (`FOLD`) and adds c5 together with the message block (h + c5 + m, with
+per-limb carries of up to 2). The value entering each multiplication is
+exactly what a full propagation would give, so the bounds below are
+unchanged. After the loop the pending d4 is folded and c5 propagated once.
+On entry R24 = 0 and R25 = the stored h4, so the first in-loop fold turns the
+bits of the stored h above 2^130 into the initial c5 (c5 = 5*(h4>>2),
+h4 &= 3), exactly what the separate entry pre-fold of the previous version did.
 
-The same approach (radix 2^32 with MULTU/MADDU and s_i = 5*r_i/4) is used by
-OpenSSL's `poly1305-mips.pl` (32-bit path). It inspired this code, which was
-written from scratch for the Go assembler.
+The same approach (radix 2^32 with MULTU/MADDU, s_i = 5*r_i/4, carries added
+with `maddu hi, 1`) is used by OpenSSL's `poly1305-mips.pl` (32-bit path). It
+inspired this code, which was written from scratch for the Go assembler.
+
+**Scheduling** (timings measured with probe loops on the MT7621, 2026-11-16):
+MADDU issues every cycle; MFLO/MFHI/MUL results stall the next ~4
+instructions; MFLO right after a MADDU costs ~1 cycle; an LWL right after the
+LWR into the same register stalls; no difference was observed between a
+zero and a random key (no sign of an operand-dependent early-out). The
+block keeps every MFHI/MFLO result at least 5 instructions away from its use,
+puts the MUL where HI/LO are dead (MUL leaves HI/LO unpredictable before
+MIPS32r6), and loads unaligned words as 4 x LWR then 4 x LWL.
 
 **MADDU.** The Go mips assembler only knows the signed `MADD`, so `MADDU rs, rt`
 is emitted as `WORD $(0x70000001 | rs<<21 | rt<<16)`. The Go mips backend never
@@ -58,8 +72,8 @@ reorders instructions (`nosched` is always true; each branch delay slot gets a
 NOP), and `WORD` is a scheduling barrier anyway. MIPS32 cores interlock
 HI/LO, so no hazard NOPs are needed.
 
-**Unaligned input.** Two loops: aligned (`LW`) and unaligned (`LWR`/`LWL`
-pairs, `MOVWR`/`MOVWL` in Go syntax), selected once per call by `msg & 3`.
+**Unaligned input.** Two loops: aligned (`LW`) and unaligned (4 x `LWR` then
+4 x `LWL`, `MOVWR`/`MOVWL` in Go syntax), selected once per call by `msg & 3`.
 
 **Partial final block.** This is handled in Go (`update`): copy into a zeroed
 16-byte buffer, append 0x01, and call `updateBlocks(..., padbit=0)`.
@@ -67,9 +81,11 @@ Full blocks use padbit=1 (adds 2^128).
 
 **Constant time (what was checked).** No branches or memory addresses depend
 on secrets. Carries use SGTU. Branches depend only on length and alignment.
-Not verified: whether the 1004K multiply unit's timing depends on operand
-values (e.g. an early-out for narrow operands). Go's generic code on this
-core also ends up in 32x32 MULTU, so it has the same exposure.
+Multiplier timing: a zero key and a random key benchmark identically on the
+MT7621 (2026-11-16), so there is no sign of an early-out for narrow
+operands; that one comparison is not a proof of constant-time multiplies.
+Go's generic code on this core also ends up in 32x32 MULTU, so it has the
+same exposure.
 
 ### Register map
 
@@ -80,8 +96,11 @@ core also ends up in 32x32 MULTU, so it has the same exposure.
 | R4..R8 | h0..h4 |
 | R9..R12 | r0..r3 |
 | R13..R15 | s1..s3 |
-| R25 | c5 (pending fold, carried across iterations); h4*r0 inside a block |
-| R16..R21, R24 | temporaries |
+| R16..R19 | message words, then h + c5 + m (the multiplication inputs) |
+| R20 | carry temporary (and the state pointer in the prologue) |
+| R21 | constant 1 (for `MADDU hi, 1`) |
+| R24 | HI of the previous column (carry-in); temporary in the fold |
+| R25 | h4*r0 -> d4 -> c5; with R24 the pending d4 carried across iterations |
 
 Not used: R22 (REGCTXT), R23 (REGTMP; no instruction expands to a sequence
 that uses it), R26/R27, R28 (SB), R29 (SP), R30 (g), R31 (LR). Leaf function,
@@ -93,6 +112,7 @@ Notation: all h_i < 2^32 as registers; p = 2^130 - 5.
 
 1. **Entry.** The macState invariant (shared with the generic code) is h < 2p
    < 2^131, so h4 <= 7 and the word at offset 20 is 0. The prologue sets
+   R24 = 0 and R25 = h4, so the first in-loop fold computes d4 = h4,
    c5 = 5*(h4>>2) <= 5 and h4 = h4 & 3 <= 3. The value is unchanged mod p.
 
 2. **Loop invariant at block start.** low = h0 + ... + h4*2^128 < 2^130
@@ -108,21 +128,26 @@ Notation: all h_i < 2^32 as registers; p = 2^130 - 5.
    h_i*s_j < 2^32 * 1.25*2^28. Per column (at most 4 full-width products plus
    h4*s_j <= 6*1.25*2^28): d0 < 4.75*2^60, d1 < 4.5*2^60 + 2^32, and so on.
    All are < 2^63, so the 64-bit HI:LO accumulator never overflows. Carry-ins
-   d_i>>32 < 2^31 keep each column < 2^63. Each 64-bit add of a carry-in uses
-   one SGTU carry into the high word, and the high word cannot overflow.
+   d_i>>32 < 2^31 keep each column < 2^63. The carry-in is added inside the
+   accumulator as the product hi*1 (`MADDU R24, R21`), so the same bound
+   covers it and the high word cannot overflow.
 
 5. **d4 and fold.** d3 < 4*(2^32-1)*(2^28-1) + 6*1.25*2^28 + 2^31 < 2^62, so
    d3>>32 < 2^30. With h4' <= 6 and r0 < 2^28, d4 = h4'*r0 + (d3>>32)
    < 6*2^28 + 4*2^28 = 10*2^28 < 2^32 (no 32-bit overflow).
    c5 = (d4 & ~3) + (d4>>2) <= 1.25*d4 < 12.5*2^28 < 2^32 (no overflow).
    The new low part is h4 = d4 & 3 <= 3, so low < 2^130. The invariant from
-   step 2 holds again.
+   step 2 holds again. (The fold runs at the start of the next block or on
+   exit rather than at the end of this one; d4 = R24 + R25 is the same number
+   either way, and nothing reads h4 or c5 in between.)
    Without the entry pre-fold, h4' could reach 9 (h = 2p-1 plus an all-0xff
    block). Then d4 < 13*2^28 and c5 could reach about 16.25*2^28 > 2^32. The
-   prologue pre-fold exists to rule that out. The first version handled it
+   entry pre-fold (now the first in-loop fold, from R24 = 0 and R25 = stored
+   h4) exists to rule that out. The first version handled it
    with an explicit carry, and `TestMipsleWorstCase` covers exactly this case.
 
-6. **Exit.** h = low + c5 is propagated with a carry chain, giving
+6. **Exit.** The pending d4 is folded (step 5), then h = low + c5 is
+   propagated with a carry chain, giving
    h4 <= 3 + 1 = 4. So h < 5*2^128 < 2p, which satisfies finalize's
    precondition. The word at offset 20 is written as 0.
 
@@ -143,6 +168,10 @@ identical tags.
   6*2^128-1} x messages of lengths {0,1,15,16,17,31,32,33,64,255,256,1420},
   each all-0xff, all-zero and random. Aligned and unaligned.
 - `TestMipsleWorstCase`: h = 2p-1, max r, all-0xff block, 1000 rounds.
+- `TestMipsleExitCarry` (added 2026-11-16): r = 1 makes the multiplication
+  the identity, so h = 7*2^128 plus a crafted block drives the final c5
+  propagation through exactly k = 0..3 all-ones limbs. Random inputs almost
+  never reach this; without it, deleting the h2 -> h3 carry survived.
 - `TestMipsleUpdateRandom`: 4000 random keys, states (uniform in [0,2p) or
   built from carry-prone words 0/1/0xffffffff/0xfffffffe/0xfffffffb) and
   lengths 0..4096, with misaligned slices.
@@ -167,6 +196,14 @@ device; the suite failed for every one:
   file, full mode. Edge catches all three; Random also catches one.
 - The rarest to catch was dropping the final carry into h4: only Edge and
   Chain detect it.
+- **2026-11-16, block rewrite (carry-in via MADDU, fold at block start):**
+  41 single-instruction deletion mutants (every instruction of FOLD, the
+  message add and its carries, the three `MADDU hi, 1`, the MUL, the exit
+  propagation, and the prologue's `R24 = 0`), full mode, on the device.
+  40 failed at once; the survivor was the exit propagation's h2 -> h3 carry
+  (`SGTU R20, R6, R20`, code unchanged from the previous version, so an old
+  test gap). `TestMipsleExitCarry` was added; with it all 9 exit-propagation
+  mutants fail, the h2 -> h3 one only through the new test.
 
 Commands (Git Bash; from `work/xcrypto`):
 
@@ -196,18 +233,25 @@ The seal/open numbers include the (then in-progress) mipsle chacha20
 asm (chacha20-only was ~377-387 Mbit/s in the same runs), so they are not a
 poly1305-only measurement. 4 threads, v1: poly1305 2239 Mbit/s, seal 527.
 
-Only the aligned loop was benchmarked (the bench buffers are aligned). The
-unaligned loop is tested for correctness only. TestBurnin (1e10 iterations)
+That version: about 78 cycles per block in the loop (73 instructions plus a
+delay-slot NOP, the rest HI/LO read stalls). TestBurnin (1e10 iterations)
 was not run.
 
-About 93 cycles per block at 880 MHz, from about 73 instructions per block
-plus 2 delay-slot NOPs. The rest are mostly HI/LO read stalls.
+**Block rewrite (2026-11-16, performance sweep):** carry-in
+via `MADDU hi, 1`, fold at the start of the next block, interleaved unaligned
+loads: 65 instructions per block (incl. the NOP), about 67 cycles.
+Sweep benchmark (median of interleaved runs, 1420 bytes):
 
-**Tried and rejected:** interleaving the message add with the d0 product group
-and moving the MUL after the d0 read gave 1188 Mbit/s, within noise and
-slightly worse.
+| | previous | rewrite |
+|---|---|---|
+| poly1305 only, aligned | 1210 Mbit/s | 1358 Mbit/s (−11 % time) |
+| poly1305 only, unaligned (offset 1) | 1117 Mbit/s | 1294 Mbit/s (−14 % time) |
 
-**Further ideas (not done):**
-- Free registers (e.g. keep end/padbit in the argument slots) so the next
-  block's loads can fill the d1 HI/LO stall window.
-- 2x unroll to save one branch-delay NOP per block (about 1%).
+**Tried and rejected:**
+- Interleaving the message add with the d0 product group and moving the MUL
+  after the d0 read (first version): 1188 Mbit/s, within noise.
+- Only moving the d3 MFLO/MFHI up (the "V2" reorder): ~1–2 %, superseded.
+- Filling the MADDU -> MFHI gaps of columns 0 and 1 with the h4 carry adds and
+  the pointer increment: ±0.4 %, no gain.
+- Hand-encoding the loop branch to put an MFLO in its delay slot: no gain
+  over the rewrite, and fragile (branch offset must be recomputed by hand).
