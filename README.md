@@ -1,5 +1,11 @@
 # mipsle-chacha
 
+In short: Tailscale, the VPN on the GL.iNet Mango 2 travel router, encrypts all traffic with
+ChaCha20-Poly1305, but on the router's MIPS processor it was using slow generic code. This repo adds a
+native assembler version of ChaCha20 and Poly1305, tuned for the router's CPU, and rebuilds the community
+"tiny" Tailscale build for the router with it. Encryption is now about 5× faster, and real VPN throughput
+went up by about 20 % on direct connections and over 50 % through Tailscale's relay servers.
+
 MIPS32 little-endian (softfloat) assembly for ChaCha20 and Poly1305, and a
 reproducible pipeline that builds Tailscale's `tailscaled` with it for a
 GL.iNet GL-MG1300 router. Hobby project.
