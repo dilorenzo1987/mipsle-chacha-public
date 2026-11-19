@@ -46,8 +46,9 @@ Notes on the table:
 - (2) As released, the community build is compressed with UPX. On this router (128 MB RAM) that currently fails
   by default: during boot the kernel's out-of-memory killer ends tailscaled (the author's observation, November
   2026). A UPX-packed binary holds its whole unpacked image in memory, while an unpacked binary is paged in from
-  flash on demand. The author therefore ran the build unpacked (`upx -d`); the values in this row are from that
-  unpacked binary, and the builds from this repository are not compressed.
+  flash on demand. Since 2026-11-18 the community updater has a `--no-upx` option that installs an uncompressed
+  tiny build from releases that provide one. The author ran the build unpacked (`upx -d`); the values in this
+  row are from that unpacked binary, and the builds from this repository are not compressed.
 - (3) The 7.2 and the 14.0 were measured three days apart with different download servers, so the factor is
   approximate. The steps in between were each measured back to back within one session (+56 %, +9 %, +4 %,
   +15 %) and multiply to the same factor. The last step comes from a single session; its size is uncertain by
