@@ -56,6 +56,13 @@ func (h *mac) Write(p []byte) (int, error) {
 }
 
 func (h *mac) Sum(out *[16]byte) {
+	if h.offset == 0 {
+		// No buffered tail (always the case for chacha20poly1305, whose
+		// padding and length fields end on a block boundary): finalize only
+		// reads the state, so the copy below is not needed.
+		finalize(out, &h.h, &h.s)
+		return
+	}
 	state := h.macState
 	if h.offset > 0 {
 		update(&state, h.buffer[:h.offset])

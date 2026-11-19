@@ -60,7 +60,7 @@ tailscaled used on average 1.6 of the 4 hardware threads.
 | GC mark | 0.3 % |
 
 - TUN offload is active (TSO/GSO/GRO on the `tailscale0` device), so there is nothing to switch on there.
-- GL's init script sets `GOGC=40` / `GOMEMLIMIT=35MiB` on devices with < 128 MB RAM. GC and allocation cost
+- GL's init script sets `GOGC=40` / `GOMEMLIMIT=35MiB` when MemTotal is below 128 MB (this router: 117 MB). GC and allocation cost
   under 2 % of tailscaled's CPU, so tuning these cannot give a measurable gain; left as is.
 
 ## PGO
@@ -79,7 +79,9 @@ DERP download only, warm-up run discarded, builds interleaved (each segment = in
 - In every measurement on both days, Mbit/s × CPU-s/MB ≈ 18: tailscaled always uses about 2.25 CPUs. The
   DERP path is CPU-bound; throughput is that CPU budget divided by the CPU cost per MB.
 - The CPU cost per MB is fixed for the life of a tailscaled process but differs from one start to the next
-  (1.53–1.80 CPU-s/MB across all starts, independent of the build). That is the whole spread.
+  (1.53–1.80 CPU-s/MB across all starts in these sessions, independent of the build). That is the whole
+  spread. A later check with plain restarts of the same binary (no binary swap in between) stayed within
+  1.60–1.68; the expensive starts all came right after a new binary had been installed.
 - Compared at a similar cost level, PGO and the plain build differ by about 0–1 %.
 
 | segment | build | Mbit/s | CPU-s/MB |
@@ -95,6 +97,9 @@ The "lost samples inside emulated 64-bit atomics" bucket above (6 %) is Go's sin
 64-bit atomic operations on 32-bit MIPS (no 64-bit LL/SC): on this CPU one such operation costs ~265 ns, and
 operations on unrelated variables from different threads serialize on that one lock.
 
-Installed: `1.104.7-tiny.mipsle-chacha.2a-pgo`, sha256
+The PGO build measured here: `1.104.7-tiny.mipsle-chacha.2a-pgo`, sha256
 `9cccfa2a100caba53b4b62edc0f6328fa2287ace128f23f864a5eb6e35b112eb`, reproducible with
-`scripts/build-tailscaled.sh --suffix -tiny.mipsle-chacha.2a-pgo` (from the same checkout path, see README).
+`scripts/build-tailscaled.sh --no-goroot-patch --no-tailscaled-overlay --suffix -tiny.mipsle-chacha.2a-pgo
+--variant chacha2a-pgo` (from the same checkout path, see README, and with the repository as it was on that date:
+later builds add `overlay/tailscaled/`, `overlay/goroot/` and `overlay/patches/` by default, use another PGO profile
+and a different ChaCha20 file).

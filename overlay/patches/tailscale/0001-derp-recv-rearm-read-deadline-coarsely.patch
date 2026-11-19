@@ -1,0 +1,32 @@
+diff --git a/derp/derp_client.go b/derp/derp_client.go
+index 6610321..2e1c2d4 100644
+--- a/derp/derp_client.go
++++ b/derp/derp_client.go
+@@ -42,6 +42,9 @@ type Client struct {
+ 	// Owned by Recv:
+ 	peeked  int                      // bytes to discard on next Recv
+ 	readErr syncs.AtomicValue[error] // sticky (set by Recv)
++	// mipsle-chacha: when Recv last set the read deadline (zero: never), and for which timeout.
++	deadlineSet time.Time
++	deadlineFor time.Duration
+ 
+ 	clock tstime.Clock
+ }
+@@ -538,7 +541,16 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
+ 		}
+ 	}()
+ 	for {
+-		c.nc.SetReadDeadline(time.Now().Add(timeout))
++		// mipsle-chacha: re-arm the read deadline only every timeout/8 instead of for every
++		// frame (SetReadDeadline re-arms a runtime timer: ~1.5 % of tailscaled's CPU on a
++		// DERP-heavy MIPS router). The deadline is timeout+timeout/8 ahead, so it never fires
++		// earlier than before: after timeout..timeout*9/8 of silence instead of exactly timeout.
++		// time.Since on a monotonic time costs one clock read, time.Now two.
++		if c.deadlineSet.IsZero() || timeout != c.deadlineFor || time.Since(c.deadlineSet) >= timeout/8 {
++			c.deadlineSet = time.Now()
++			c.deadlineFor = timeout
++			c.nc.SetReadDeadline(c.deadlineSet.Add(timeout + timeout/8))
++		}
+ 
+ 		// Discard any peeked bytes from a previous Recv call.
+ 		if c.peeked != 0 {

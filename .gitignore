@@ -5,3 +5,4 @@ build/
 *-mipsle
 gocache/
 gopath/
+__pycache__/

@@ -18,6 +18,8 @@ esac
 case "$(uname -m)" in x86_64|amd64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac
 FILE="go$VER.$OS-$ARCH.$EXT"
 if [ -x "$DEST/go/bin/go" ] || [ -x "$DEST/go/bin/go.exe" ]; then
+    have=$(head -1 "$DEST/go/VERSION" 2>/dev/null || true)
+    [ "$have" = "go$VER" ] || { echo "$DEST/go is $have, not go$VER - delete it and re-run" >&2; exit 1; }
     echo "already present: $("$DEST/go/bin/go" version)"; exit 0
 fi
 mkdir -p "$DEST"; TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT

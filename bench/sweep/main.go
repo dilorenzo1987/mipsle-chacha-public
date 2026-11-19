@@ -98,12 +98,18 @@ func open(n, off, adLen int) func() {
 
 func main() {
 	rounds, ms := 5, 300
-	if len(os.Args) > 1 {
-		rounds, _ = strconv.Atoi(os.Args[1])
+	posInt := func(i int, def int) int {
+		if len(os.Args) <= i {
+			return def
+		}
+		v, err := strconv.Atoi(os.Args[i])
+		if err != nil || v < 1 {
+			fmt.Fprintf(os.Stderr, "sweep: argument %d must be a positive integer, got %q\n", i, os.Args[i])
+			os.Exit(2)
+		}
+		return v
 	}
-	if len(os.Args) > 2 {
-		ms, _ = strconv.Atoi(os.Args[2])
-	}
+	rounds, ms = posInt(1, rounds), posInt(2, ms)
 	cases := []tc{
 		{"chacha20 1420 aligned", 1420, cc(1420, 0, 0)},
 		{"chacha20 1420 unaligned", 1420, cc(1420, 1, 3)},

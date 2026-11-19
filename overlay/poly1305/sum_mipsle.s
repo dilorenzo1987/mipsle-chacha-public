@@ -6,7 +6,7 @@
 
 #include "textflag.h"
 
-// Poly1305 block function for MIPS32r2 little-endian (e.g. MT7621 / 1004Kc).
+// Poly1305 block function for MIPS32 (r1 instructions only) little-endian (e.g. MT7621 / 1004Kc).
 //
 // Radix 2^32 approach, inspired by OpenSSL's poly1305-mips.pl (32-bit path),
 // written from scratch.

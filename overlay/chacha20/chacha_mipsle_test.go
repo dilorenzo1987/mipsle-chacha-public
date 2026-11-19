@@ -144,8 +144,8 @@ func TestMIPSXORKeyStreamDifferential(t *testing.T) {
 	}
 }
 
-// TestMIPSCounterOverflow checks the last block before the counter wraps and
-// the panic afterwards.
+// TestMIPSCounterOverflow checks the last block before the counter wraps, then one more byte: a panic
+// if the counter is exhausted, otherwise the matching byte from the leftover key stream.
 func TestMIPSCounterOverflow(t *testing.T) {
 	r := rand.New(rand.NewSource(3))
 	for _, n := range []int{1, 63, 64, 65, 128, 200} {
@@ -160,13 +160,26 @@ func TestMIPSCounterOverflow(t *testing.T) {
 		if want := genericStream(ref, ctr, src); !bytes.Equal(dst, want) {
 			t.Fatalf("n=%d: mismatch at counter end", n)
 		}
-		func() {
-			defer func() {
-				if recover() == nil && n%64 == 0 {
-					t.Errorf("n=%d: expected panic after overflow", n)
-				}
-			}()
-			a.XORKeyStream(dst[:1], src[:1])
+		// One more byte: with n%64 == 0 the counter is exhausted and the call must panic; otherwise it is
+		// served from the leftover key stream of the last block and must match the generic stream.
+		extra := []byte{byte(r.Intn(256))}
+		out := make([]byte, 1)
+		panicked := func() (p bool) {
+			defer func() { p = recover() != nil }()
+			a.XORKeyStream(out, extra)
+			return false
 		}()
+		if n%64 == 0 {
+			if !panicked {
+				t.Errorf("n=%d: expected panic after overflow", n)
+			}
+			continue
+		}
+		if panicked {
+			t.Fatalf("n=%d: unexpected panic on the leftover key stream", n)
+		}
+		if want := genericStream(ref, ctr, append(append([]byte{}, src...), extra...)); out[0] != want[n] {
+			t.Fatalf("n=%d: leftover key stream byte mismatch at the counter end", n)
+		}
 	}
 }

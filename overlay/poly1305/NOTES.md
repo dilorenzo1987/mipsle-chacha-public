@@ -1,4 +1,4 @@
-# Poly1305 for GOARCH=mipsle (MIPS32r2, MT7621 / 1004Kc)
+# Poly1305 for GOARCH=mipsle (MIPS32r1 instructions only; tuned on MT7621 / 1004Kc)
 
 Files (for `golang.org/x/crypto/internal/poly1305` v0.58.0 and the Go stdlib
 vendored copy `src/vendor/golang.org/x/crypto/internal/poly1305`):
@@ -6,7 +6,12 @@ vendored copy `src/vendor/golang.org/x/crypto/internal/poly1305`):
 - `sum_mipsle.go`: glue, `//go:build gc && !purego` (+ the `_mipsle` file suffix).
   It declares `updateBlocks` (asm), a Go `update(state, msg)` with the same
   semantics as `updateGeneric`, and `mac` with Write/Sum mirroring `sum_asm.go`.
-  It uses no imports, so it also builds in the stdlib vendor tree.
+  `Sum` skips the copy of the 56-byte state when no partial block is buffered (always the case in
+  chacha20poly1305, whose padding and length fields end on a block boundary): −3.8 % seal / −1.8 % open
+  for 64-byte messages, no measurable change at 1420 bytes.
+- `sum_layout_mipsle.go`: compile-time check that `macState` still has the layout the asm assumes
+  (h at offset 0, 24 bytes; r at offset 24); generates no code. Its only import is `unsafe`, which also
+  works in the stdlib vendor tree.
 - `sum_mipsle.s`: `func updateBlocks(state *macState, msg []byte, padbit uint32)`.
 - `sum_mipsle_test.go`: differential tests (`//go:build gc && !purego`).
   **x/crypto only.** It uses `stressFlag` and `unalignBytes` from x/crypto's
@@ -191,9 +196,10 @@ device; the suite failed for every one:
 - Deleting a carry, fold or propagation instruction: 7 mutants on v1 and 9
   on the final asm. These ran with `-test.short` and the earlier version of
   the test file (before the extreme-word random cases were added).
-- Replacing each of the three limb>=1 carry combines `ADDU R21, R20` with
-  `OR` (wrong now that carries can be 2): 3 mutants, final asm and final test
-  file, full mode. Edge catches all three; Random also catches one.
+- Replacing each of the three limb>=1 carry combines (`ADDU R21, R20` in the
+  version before the 2026-11-16 block rewrite; now `ADDU R24, R20`, R21 holds
+  the constant 1) with `OR` (wrong now that carries can be 2): 3 mutants,
+  that asm and its test file, full mode. Edge catches all three; Random also catches one.
 - The rarest to catch was dropping the final carry into h4: only Edge and
   Chain detect it.
 - **2026-11-16, block rewrite (carry-in via MADDU, fold at block start):**
@@ -205,9 +211,9 @@ device; the suite failed for every one:
   test gap). `TestMipsleExitCarry` was added; with it all 9 exit-propagation
   mutants fail, the h2 -> h3 one only through the new test.
 
-Commands (Git Bash; from `work/xcrypto`):
+Commands (bash; from `work/xcrypto`):
 
-    export GOPATH=/c/GitHub/mipsle-chacha/work/gopath GOCACHE=/c/GitHub/mipsle-chacha/work/gocache \
+    R=<repo root>; export GOPATH=$R/work/gopath GOCACHE=$R/work/gocache \
       GOTOOLCHAIN=local GOFLAGS=-mod=mod GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0
     go vet ./internal/poly1305 && go vet -tags purego ./internal/poly1305
     go test -c -o p.test ./internal/poly1305

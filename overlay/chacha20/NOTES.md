@@ -10,24 +10,51 @@ to v0.58.0). Build tags: `gc && !purego`, plus the `_mipsle` file suffix.
 ## Design
 - One 64-byte block at a time, all 16 state words in registers, `ROTR`
   (MIPS32r2) for each rotation, so a quarter round is 12 instructions.
-- The 10 double rounds are fully unrolled; one round body serves both the
-  aligned and the unaligned path. The path is picked per call
-  (`(src|dst)&3`) and only the feed-forward differs: `LW/SW` vs
-  `LWR/LWL` + `SWR/SWL`. A variant with two complete loops (8.7 KB instead
-  of 4.9 KB) was ~1 % faster in micro-benchmarks but not measurably better in
-  tailscaled (see below), so the smaller single loop was kept.
-- The 3 counter-independent quarter rounds of the first column round are
-  computed once per call and kept in a 48-byte stack frame (the asm does not
-  use `Cipher.p1..p15`/`precompDone`, so it only depends on the
-  key/counter/nonce layout).
+  Requires a MIPS32r2 CPU: Go's mipsle baseline is MIPS32r1 and the build
+  constraint (`gc && !purego`, `_mipsle`) cannot tell r1 from r2, so on an r1
+  core this code would raise SIGILL. (The Poly1305 assembly is MIPS32r1-only.)
+- **Compact on purpose (since 2026-11-19).** The 10 double rounds are a loop
+  (96 instructions plus 3 for the loop), there is no per-call precompute and
+  no stack frame: 1368 bytes of code instead of 4920. A call touches 29
+  instruction-cache lines (aligned) or 34 (unaligned) instead of 140 / 145.
+  It executes 1104 / 1138 instructions per block instead of 1034 / 1068
+  (+6.8 %) and 11 per call instead of 78. See "Why compact" below.
+- One round body serves both the aligned and the unaligned path. The path is
+  picked per call (`(src|dst)&3`) and only the feed-forward differs: `LW/SW`
+  vs `LWR/LWL` + `SWR/SWL`.
+- The asm does not use `Cipher.p1..p15`/`precompDone`, so it only depends on
+  the key/counter/nonce layout.
 - Feed-forward ordering (2026-11-16): the two constant words are handled in
   pairs with both loads first, and on the unaligned path no LWL directly
   follows the LWR into the same register (measured to stall on the 1004Kc);
-  every loaded word is used at least one instruction later. Same instruction
-  count as before (1034 per block aligned, 1068 unaligned).
-- The quarter rounds are 924 of those instructions (12 per QR with ROTR, the
-  minimum on MIPS32r2), so measured ~1070 cycles per block is close to
-  1 instruction per cycle and little is left.
+  every loaded word is used at least one instruction later.
+- The quarter rounds are 960 of the 1104 instructions per block (12 per QR
+  with ROTR, the minimum on MIPS32r2); the CPU runs them at close to one
+  instruction per cycle.
+
+### Why compact
+The MT7621 has a 32 KB instruction cache (and 256 KB of L2 shared by both
+cores), and the path of one packet through the kernel and tailscaled is far
+larger. When a message's first ChaCha20 block starts, the cipher's code is in
+neither cache. Three independent measurements:
+- A CPU profile of tailscaled under load, split by the call site in
+  `chacha_generic.go`: for the call that produces the first block of every
+  message (the Poly1305 key block), 84-88 % of the samples sit on the first
+  instruction of a 32-byte cache line; in the loop over the following blocks
+  17-21 % (an even spread would be 12.5 %). With the unrolled code that first
+  block took ~22 us, as long as 14 of the following blocks.
+- A benchmark on the device that evicts the caches before every single
+  operation (`bench/cold`): the key block costs
+  51.7 us with the unrolled code and 34.6 us with the loop; 111 fewer lines
+  save 17.0 us, i.e. ~153 ns per line - the time of about 135 instructions.
+- Counting lines and instructions of whole seal/open operations in an
+  interpreter (`sim/`) and applying "155 ns per line + one cycle per instruction"
+  reproduces the device's cold timings within ~1 % for eight cases.
+So per message the unrolled form saved 70 instructions per block and paid
+about 110 extra line fetches: for a 1280-byte packet (21 blocks) -1,500
+instructions against +17 us, which is worth about 15,000 instructions.
+Warm micro-benchmarks show the opposite sign (see Benchmarks); they measure a
+state the router is never in between two packets.
 
 ### Register map
 | Reg | Use |
@@ -38,9 +65,10 @@ to v0.58.0). Build tags: `gc && !purego`, plus the `_mipsle` file suffix.
 | R19 | src end |
 | R20 | `&Cipher.key` (key 0..28, counter 32, nonce 36..44) |
 | R25 | non-zero = unaligned path |
-| R21, R24 | temps |
-R22, R23 (REGTMP, used by the assembler for 32-bit constants in `ADDU $const`),
-and R26..R31 are not touched.
+| R21, R24 | temps; R24 also counts the double rounds |
+R22 (REGCTXT), R26..R28, R30 and R31 are not touched; R29 (SP) is not moved (no frame).
+R23 (REGTMP) is clobbered by the assembler, which loads the 32-bit constants of
+`ADDU $const` into it (LUI/ORI).
 
 ### bufSize
 `bufSize = blockSize` (64). There is no multi-block SIMD path, so a bigger
@@ -72,7 +100,9 @@ go test -c -tags purego ...    # generic path still builds and passes
   in-place, counters wrapping mod 2^32, guard bytes around dst, src left unchanged.
 - Public `XORKeyStream` vs generic over 3000 cases: 0–4200 bytes, random chunking,
   offsets, in-place, 12- and 24-byte nonces, counters 0, random, or just below 2^32.
-- The last block before counter overflow, then the panic.
+- The last block before counter overflow; then one more byte, which must panic when the counter is
+  exhausted (length a multiple of 64) and otherwise must come from the leftover key stream and match the
+  generic stream (extended 2026-11-17, run on the device).
 
 Results (2026-11-16):
 - chacha20: 10/10 tests pass. chacha20poly1305: 3/3 pass.
@@ -89,14 +119,34 @@ Results (2026-11-16):
 | chacha20 only, unaligned buffer | 76.8 | ~369 |
 | chacha20poly1305 seal (pure-Go poly1305) | 48.7 | ~106 |
 
-A first version with a rolled round loop and no precompute reached ~362–367 Mbit/s.
+A first version with a rolled round loop and no precompute reached ~362–367 Mbit/s
+(warm); that is the form used again since 2026-11-19.
+
+Cold and warm, 2026-11-19 (ns per operation, median of 300, 3 interleaved runs;
+cold = caches evicted before each operation; unrolled = the code used until then):
+| case | cold unrolled | cold loop | warm unrolled | warm loop |
+|---|---|---|---|---|
+| new cipher + 32 bytes (key block) | 51,658 | 34,633 (-33 %) | 5,349 | 5,114 |
+| new cipher + 1280 bytes, aligned | 60,750 | 45,273 (-25 %) | 24,695 | 26,547 (+7.5 %) |
+| new cipher + 1344 bytes at offset 5 | 63,624 | 48,266 (-24 %) | 26,858 | 28,694 (+6.8 %) |
+| open 1280 bytes, WireGuard layout | 94,146 | 78,587 (-16.5 %) | 35,856 | 38,791 |
+| open 1350 bytes, TLS layout | 104,231 | 89,111 (-14.5 %) | 41,609 | 42,826 |
+| seal 64 bytes | 64,344 | 47,059 (-27 %) | 6,628 | 6,696 |
+The loop was faster in 3 of 3 runs in every cold case (ranges +-0.3 %).
 `BenchmarkChaCha20/4096`: 52.5 MB/s (~1220 ns per block).
 The seal figure uses the unmodified pure-Go poly1305, which now dominates;
 OpenSSL's ChaCha20-Poly1305 does 213 Mbit/s.
 Benchmark numbers vary by roughly ±3% between runs, and one run dropped to
 ~250 Mbit/s, probably because of other load on the device.
 
-## Considered, not kept (2026-11-16)
+## Considered, not kept
+All of these were judged with warm micro-benchmarks on 2026-11-16. They were
+rejected for small or unmeasurable gains; with the cost of cold code known
+(see "Why compact"), each of them would also lose because it adds code.
+- **Fully unrolled rounds with the first column round of columns 1..3
+  precomputed per call** (the form used until 2026-11-19): 6.4 % fewer
+  instructions per block, 3.6 times the code. Faster only when the code is
+  already in the cache.
 - **Two separate loops, counter in R25, constants and C0+key[0] on the stack** (the sweep's "B"):
   1023/1055 instructions per block instead of 1034/1068, and in micro-benchmarks 1.4 % / 2.4 % faster
   (streaming) and 0.5–1 % on seal/open; against the kept version (single loop with the feed-forward

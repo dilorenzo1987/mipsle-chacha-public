@@ -21,10 +21,21 @@
 #   --variant NAME       output name build/tailscaled-mipsle-NAME
 #   --ref BIN            diff `go version -m` of the result against BIN
 #   --pgo FILE           profile-guided optimization with this CPU profile instead of
-#                        the default (overlay builds use pgo/2026-11-16_A_mixed90s.pprof,
-#                        a 90 s CPU profile of tailscaled on the router under traffic)
+#                        the default (overlay builds use pgo/2026-11-17_merged-mixed-derp.pprof,
+#                        two CPU profiles of tailscaled on the router merged: 90 s mixed traffic + 75 s DERP)
 #   --no-pgo             overlay build without PGO (baseline builds never use PGO,
 #                        so --no-overlay still reproduces admon's build exactly)
+#   --no-tailscaled-overlay  overlay build without overlay/tailscaled/ (extra cmd/tailscaled files,
+#                        e.g. GOMAXPROCS=3 on 4-thread mipsle)
+#   --goroot-patch FILE  overlay builds only: patch (paths a/src/..., -p1) for the toolchain copy in
+#                        work/goroot-patched; default overlay/goroot/atomic_mipsx-lock-striping.patch
+#                        (lock striping for 64-bit atomics on 32-bit MIPS)
+#   --no-goroot-patch    overlay build with an unmodified Go runtime
+#   --no-source-patches  overlay build without overlay/patches/ (source patches for Tailscale,
+#                        applied to the reset checkout, and for wireguard-go, applied to a copy of
+#                        the module that the alternate go.mod replaces it with)
+#   --no-aead            overlay build without overlay/chacha20poly1305/ (the assembly seal/open routine):
+#                        the ChaCha20 and Poly1305 assembly stay and are joined by the generic Go code
 #   -h | --help
 #
 # Everything mutable lives in work/ (cached between runs) and build/ (outputs).
@@ -65,6 +76,7 @@ TS_DIR="$WORK/tailscale"
 ADMON_DIR="$WORK/admon"
 GOROOT_PATCHED="$WORK/goroot-patched"
 XC_PATCHED="$WORK/xcrypto-patched"
+WGGO_PATCHED="$WORK/wireguard-go-patched"
 MODFILE_DIR="$WORK/modfile"
 OVERLAY_DIR="$ROOT/overlay"
 
@@ -74,32 +86,60 @@ SUFFIX=""
 VARIANT=""
 REF=""
 PGO=""
+GOROOT_PATCH=""
+TS_OVERLAY=true
+SRC_PATCHES=true
+NO_AEAD=""
 
 die()  { printf 'build-tailscaled: ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '==> %s\n' "$*"; }
+# absolute path of an existing file argument (fails early instead of producing "/name")
+absfile() { local d; d=$(CDPATH='' cd -- "$(dirname -- "$1")" 2>/dev/null && pwd) || die "$2: directory of $1 not found"
+            [ -f "$d/$(basename -- "$1")" ] || die "$2: $1 not found"; printf '%s/%s\n' "$d" "$(basename -- "$1")"; }
+EXPLICIT_OVERLAY_OPTS=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --overlay-dir|--suffix|--variant|--ref|--pgo|--goroot-patch) [ $# -ge 2 ] || die "$1 needs a value" ;;
+    esac
+    case "$1" in
         --no-overlay)  OVERLAY=false; shift ;;
         --check)       CHECK=true; shift ;;
-        --overlay-dir) OVERLAY_DIR=$(CDPATH='' cd -- "$2" && pwd); shift 2 ;;
+        --overlay-dir) OVERLAY_DIR=$(CDPATH='' cd -- "$2" 2>/dev/null && pwd) || die "--overlay-dir: $2 not found"; shift 2 ;;
         --suffix)      SUFFIX=$2; shift 2 ;;
         --variant)     VARIANT=$2; shift 2 ;;
         --ref)         REF=$2; shift 2 ;;
-        --pgo)         PGO=$(CDPATH='' cd -- "$(dirname -- "$2")" && pwd)/$(basename -- "$2"); shift 2 ;;
-        --no-pgo)      PGO=none; shift ;;
-        -h|--help)     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --pgo)         PGO=$(absfile "$2" --pgo) || exit 1; EXPLICIT_OVERLAY_OPTS+=" $1"; shift 2 ;;
+        --no-pgo)      PGO=none; EXPLICIT_OVERLAY_OPTS+=" $1"; shift ;;
+        --no-tailscaled-overlay) TS_OVERLAY=false; EXPLICIT_OVERLAY_OPTS+=" $1"; shift ;;
+        --no-goroot-patch) GOROOT_PATCH=none; EXPLICIT_OVERLAY_OPTS+=" $1"; shift ;;
+        --no-source-patches) SRC_PATCHES=false; EXPLICIT_OVERLAY_OPTS+=" $1"; shift ;;
+        --no-aead)     NO_AEAD=1; EXPLICIT_OVERLAY_OPTS+=" $1"; shift ;;
+        --goroot-patch) GOROOT_PATCH=$(absfile "$2" --goroot-patch) || exit 1; EXPLICIT_OVERLAY_OPTS+=" $1"; shift 2 ;;
+        -h|--help)     sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
 
 if [ "$OVERLAY" = true ]; then
     : "${SUFFIX:=-tiny.mipsle-chacha}"; : "${VARIANT:=chacha}"
-    : "${PGO:=$ROOT/pgo/2026-11-16_A_mixed90s.pprof}"
+    : "${PGO:=$ROOT/pgo/2026-11-17_merged-mixed-derp.pprof}"
+    if [ -z "$GOROOT_PATCH" ]; then
+        if [ -f "$OVERLAY_DIR/goroot/atomic_mipsx-lock-striping.patch" ]; then
+            GOROOT_PATCH="$OVERLAY_DIR/goroot/atomic_mipsx-lock-striping.patch"
+        else
+            note "note: no goroot/atomic_mipsx-lock-striping.patch in $OVERLAY_DIR - unmodified Go runtime"
+        fi
+    fi
+    if [ "$TS_OVERLAY" = true ] && [ ! -d "$OVERLAY_DIR/tailscaled" ]; then
+        note "note: no tailscaled/ in $OVERLAY_DIR - no extra cmd/tailscaled files"
+    fi
 else
+    [ -z "$EXPLICIT_OVERLAY_OPTS" ] || die "only for overlay builds, not with --no-overlay:$EXPLICIT_OVERLAY_OPTS"
     : "${SUFFIX:=-tiny.mipsle-base}";   : "${VARIANT:=baseline}"
 fi
 [ "$PGO" != none ] || PGO=""
+[ "$GOROOT_PATCH" != none ] || GOROOT_PATCH=""
 
 # Native (C:/...) path for arguments handed to go.exe on Windows; identity elsewhere.
 native() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }
@@ -148,8 +188,8 @@ prepare_tailscale() {
 
     note "applying admon's GL.iNet patches (admon @ ${ADMON_COMMIT:0:7})"
     TAILSCALE_TAG="$TS_TAG" bash "$ADMON_DIR/scripts/apply-tailscale-patches.sh" \
-        --patch-dir "$ADMON_DIR/patches" --source-dir "$TS_DIR" 2>&1 | sed 's/^/    /'
-    [ "${PIPESTATUS[0]}" -eq 0 ] || die "admon patch step failed"
+        --patch-dir "$ADMON_DIR/patches" --source-dir "$TS_DIR" 2>&1 | sed 's/^/    /' ||
+        die "admon patch step failed"
     git -C "$TS_DIR" status --short | sed 's/^/    modified: /'
 
     (cd "$TS_DIR" && "$HOST_GO" mod download) || die "go mod download failed"
@@ -215,10 +255,66 @@ prepare_overlay() {
     fi
 
     note "applying overlay from $OVERLAY_DIR"
-    bash "$SCRIPT_DIR/apply-overlay.sh" --overlay-dir "$OVERLAY_DIR" \
+    bash "$SCRIPT_DIR/apply-overlay.sh" --overlay-dir "$OVERLAY_DIR" ${NO_AEAD:+--skip chacha20poly1305} \
         --pristine-xcrypto "$XC_PRISTINE" --pristine-goroot "$GO_PRISTINE" \
-        "$XC_PATCHED" "$GOROOT_PATCHED" | sed 's/^/    /'
-    [ "${PIPESTATUS[0]}" -eq 0 ] || die "apply-overlay failed"
+        "$XC_PATCHED" "$GOROOT_PATCHED" | sed 's/^/    /' || die "apply-overlay failed"
+
+    # tailscaled overlay: extra files for cmd/tailscaled (work/tailscale is reset on every run).
+    if [ "$TS_OVERLAY" = true ] && [ -d "$OVERLAY_DIR/tailscaled" ]; then
+        for f in "$OVERLAY_DIR"/tailscaled/*.go; do
+            [ -e "$f" ] || continue
+            [ ! -e "$TS_DIR/cmd/tailscaled/$(basename "$f")" ] || die "tailscaled overlay would overwrite $(basename "$f")"
+            cp "$f" "$TS_DIR/cmd/tailscaled/"
+            note "tailscaled overlay: $(basename "$f")"
+        done
+    fi
+
+    # Optional patch to the Go toolchain copy: first restore whatever a previous --goroot-patch changed (so
+    # builds without the option stay identical), then apply the requested patch and record its files.
+    local list="$GOROOT_PATCHED/.mipsle-chacha-goroot-patch-files" f
+    if [ -f "$list" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if [ -e "$GO_PRISTINE/$f" ]; then cp "$GO_PRISTINE/$f" "$GOROOT_PATCHED/$f"   # modified or deleted
+            else rm -f "$GOROOT_PATCHED/$f"; fi                                         # added by the patch
+        done <"$list"
+        rm -f "$list"
+    fi
+    if [ -n "$GOROOT_PATCH" ]; then
+        [ -f "$GOROOT_PATCH" ] || die "GOROOT patch not found: $GOROOT_PATCH"
+        # every file the patch touches (modified: a/ and b/, added: b/ only, deleted: a/ only)
+        sed -n -E 's#^(\+\+\+|---) [ab]/([^[:space:]]+).*#\2#p' "$GOROOT_PATCH" | sort -u >"$list"
+        [ -s "$list" ] || die "no '--- a/<file>' or '+++ b/<file>' lines in $GOROOT_PATCH"
+        note "applying GOROOT patch $GOROOT_PATCH ($(tr '\n' ' ' <"$list"))"
+        patch -p1 --forward --quiet -d "$GOROOT_PATCHED" <"$GOROOT_PATCH" || die "GOROOT patch failed"
+    fi
+
+    # Source patches (overlay/patches/): Tailscale patches go onto the reset checkout; wireguard-go patches
+    # onto a fresh copy of the module from the cache, which the alternate go.mod below replaces it with.
+    local wg_patches=() p wg_src
+    if [ "$SRC_PATCHES" = true ]; then
+        for p in "$OVERLAY_DIR"/patches/tailscale/*.patch; do
+            [ -e "$p" ] || continue
+            git -C "$TS_DIR" apply --whitespace=nowarn "$p" || die "tailscale patch failed: $p"
+            note "tailscale patch: $(basename "$p")"
+        done
+        for p in "$OVERLAY_DIR"/patches/wireguard-go/*.patch; do
+            [ -e "$p" ] && wg_patches+=("$p")
+        done
+    fi
+    rm -rf "$WGGO_PATCHED"
+    if [ ${#wg_patches[@]} -gt 0 ]; then
+        wg_src=$(cd "$TS_DIR" && "$HOST_GO" mod download -json github.com/tailscale/wireguard-go |
+                 sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p' | sed 's/\\\\/\//g')
+        [ -n "$wg_src" ] && [ -f "$wg_src/go.mod" ] || die "wireguard-go not found in module cache"
+        if command -v cygpath >/dev/null 2>&1; then wg_src=$(cygpath -u "$wg_src"); fi
+        cp -r "$wg_src" "$WGGO_PATCHED"
+        chmod -R u+w "$WGGO_PATCHED"
+        for p in "${wg_patches[@]}"; do
+            patch -p1 --forward --quiet -d "$WGGO_PATCHED" <"$p" || die "wireguard-go patch failed: $p"
+            note "wireguard-go patch: $(basename "$p")"
+        done
+    fi
 
     # Alternate go.mod outside the git tree: upstream go.mod stays untouched.
     mkdir -p "$MODFILE_DIR"
@@ -227,6 +323,9 @@ prepare_overlay() {
     xc_native=$(native "$XC_PATCHED")
     (cd "$TS_DIR" && "$HOST_GO" mod edit -modfile="$(native "$MODFILE_DIR/go.mod")" \
         -replace "golang.org/x/crypto=$xc_native")
+    if [ -d "$WGGO_PATCHED" ]; then
+        (cd "$TS_DIR" && "$HOST_GO" mod edit -modfile="$(native "$MODFILE_DIR/go.mod")"             -replace "github.com/tailscale/wireguard-go=$(native "$WGGO_PATCHED")")
+    fi
     MODFLAG="-modfile=$(native "$MODFILE_DIR/go.mod")"
 
     GO="$GOROOT_PATCHED/bin/go"
@@ -244,7 +343,7 @@ run_check() {
     note "chacha20 / poly1305 packages in the tailscaled build graph (GOARCH=mipsle):"
     (cd "$TS_DIR" && target_env "$GO" list ${MODFLAG:+"$MODFLAG"} -tags="$TAGS" -deps \
         -f '{{.ImportPath}}|{{.Dir}}|{{.GoFiles}}|{{.SFiles}}' ./cmd/tailscaled) |
-        grep -E '(^|/)golang.org/x/crypto/(chacha20|internal/poly1305|chacha20poly1305)\|' |
+        { grep -E '(^|/)golang.org/x/crypto/(chacha20|internal/poly1305|chacha20poly1305)\|' || true; } |
         while IFS='|' read -r ip dir gofiles sfiles; do
             printf '  %s\n      dir:     %s\n      GoFiles: %s\n      SFiles:  %s\n' \
                 "$ip" "$dir" "$gofiles" "$sfiles"
@@ -270,6 +369,7 @@ else
     note "baseline: pristine GOROOT ($GO_PRISTINE), unmodified go.mod (no replace)"
 fi
 
+[ -z "$PGO" ] || [ -f "$PGO" ] || die "PGO profile not found: $PGO"
 if [ "$CHECK" = true ]; then
     run_check
     exit 0

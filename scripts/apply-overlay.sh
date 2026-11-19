@@ -14,16 +14,21 @@
 #   --overlay-dir DIR       overlay root (default: <repo>/overlay). Expected layout:
 #                             DIR/chacha20/{chacha_mipsle.go,chacha_mipsle.s,...}
 #                             DIR/poly1305/{sum_mipsle.go,sum_mipsle.s,...}
-#   --pristine-xcrypto DIR  pristine x/crypto tree; the two target package dirs in
+#                             DIR/chacha20poly1305/{...}   (optional)
+#   --pristine-xcrypto DIR  pristine x/crypto tree; the target package dirs in
 #                           <xcrypto-dir> are restored from it before applying
-#   --pristine-goroot DIR   pristine GOROOT; the two vendored package dirs in
+#   --pristine-goroot DIR   pristine GOROOT; the vendored package dirs in
 #                           <goroot-dir> are restored from it before applying
 #   --with-tests            also copy *_test.go files (x/crypto target only)
+#   --skip NAME             treat the overlay package NAME (chacha20, poly1305 or chacha20poly1305) as absent:
+#                           its generic code stays (may be given more than once)
 #
-# Rules (per package, chacha20 -> chacha20/, poly1305 -> internal/poly1305/):
+# Rules (per package, chacha20 -> chacha20/, poly1305 -> internal/poly1305/,
+# chacha20poly1305 -> chacha20poly1305/):
 #   * copy the overlay's non-test *.go and *.s files into the package dir;
 #   * rewrite the //go:build line of the package's "noasm" file
-#       chacha20/chacha_noasm.go, internal/poly1305/mac_noasm.go
+#       chacha20/chacha_noasm.go, internal/poly1305/mac_noasm.go,
+#       chacha20poly1305/chacha20poly1305_noasm.go
 #     from   //go:build <expr>
 #     to     //go:build (<expr>) && (!mipsle || !gc || purego)
 #   * a package whose overlay dir is missing or has no non-test .go/.s files is
@@ -39,6 +44,7 @@ OVERLAY_DIR="$SCRIPT_DIR/../overlay"
 PRISTINE_XC=""
 PRISTINE_GR=""
 WITH_TESTS=false
+SKIP=""
 GUARD='(!mipsle || !gc || purego)'
 
 die() { printf 'apply-overlay: ERROR: %s\n' "$*" >&2; exit 1; }
@@ -47,11 +53,19 @@ note() { printf 'apply-overlay: %s\n' "$*"; }
 POSITIONAL=()
 while [ $# -gt 0 ]; do
     case "$1" in
+        --overlay-dir|--pristine-xcrypto|--pristine-goroot|--skip)
+            [ $# -ge 2 ] || { echo "apply-overlay: $1 needs a value" >&2; exit 2; } ;;
+    esac
+    case "$1" in
         --overlay-dir)      OVERLAY_DIR=$2; shift 2 ;;
         --pristine-xcrypto) PRISTINE_XC=$2; shift 2 ;;
         --pristine-goroot)  PRISTINE_GR=$2; shift 2 ;;
         --with-tests)       WITH_TESTS=true; shift ;;
-        -h|--help)          sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --skip)             case "$2" in
+                                chacha20|poly1305|chacha20poly1305) SKIP="$SKIP $2" ;;
+                                *) die "--skip: not an overlay package: $2" ;;
+                            esac; shift 2 ;;
+        -h|--help)          sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) [ "$1" = "-" ] && { POSITIONAL+=("$1"); shift; continue; }
             die "unknown option: $1" ;;
         *)  POSITIONAL+=("$1"); shift ;;
@@ -63,11 +77,13 @@ GR_DIR=${POSITIONAL[1]}
 
 # overlay name | package path inside x/crypto | noasm file
 PACKAGES="chacha20|chacha20|chacha_noasm.go
-poly1305|internal/poly1305|mac_noasm.go"
+poly1305|internal/poly1305|mac_noasm.go
+chacha20poly1305|chacha20poly1305|chacha20poly1305_noasm.go"
 
 # List overlay source files (non-test .go/.s) for one overlay package.
 overlay_files() {
     local d="$OVERLAY_DIR/$1" f
+    case " $SKIP " in *" $1 "*) return 0 ;; esac
     [ -d "$d" ] || return 0
     for f in "$d"/*.go "$d"/*.s; do
         [ -f "$f" ] || continue
@@ -123,7 +139,10 @@ apply_target() {
         fi
         files=$(overlay_files "$name")
         if [ -z "$files" ]; then
-            note "  $name: no overlay files in $OVERLAY_DIR/$name -- skipped (generic code stays)"
+            case " $SKIP " in
+                *" $name "*) note "  $name: skipped with --skip (generic code stays)" ;;
+                *) note "  $name: no overlay files in $OVERLAY_DIR/$name -- skipped (generic code stays)" ;;
+            esac
             continue
         fi
         while IFS= read -r f; do

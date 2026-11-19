@@ -1,0 +1,111 @@
+--- a/src/internal/runtime/atomic/atomic_mipsx.go
++++ b/src/internal/runtime/atomic/atomic_mipsx.go
+@@ -11,12 +11,17 @@
+ 	"unsafe"
+ )
+ 
+-// TODO implement lock striping
+-var lock struct {
++// Lock striping (as on arm): 64-bit operations on unrelated addresses use different locks.
++var locktab [64]struct {
+ 	state uint32
+ 	pad   [cpu.CacheLinePadSize - 4]byte
+ }
+ 
++//go:nosplit
++func addrLock(addr *uint64) *uint32 {
++	return &locktab[(uintptr(unsafe.Pointer(addr))>>3)&(uintptr(len(locktab))-1)].state
++}
++
+ //go:noescape
+ func spinLock(state *uint32)
+ 
+@@ -32,12 +37,12 @@
+ 	// force dereference before taking lock
+ 	_ = *addr
+ 
+-	spinLock(&lock.state)
++	spinLock(addrLock(addr))
+ }
+ 
+ //go:nosplit
+-func unlock() {
+-	spinUnlock(&lock.state)
++func unlock(addr *uint64) {
++	spinUnlock(addrLock(addr))
+ }
+ 
+ //go:nosplit
+@@ -47,7 +52,7 @@
+ 	new = *addr + uint64(delta)
+ 	*addr = new
+ 
+-	unlock()
++	unlock(addr)
+ 	return
+ }
+ 
+@@ -58,7 +63,7 @@
+ 	old = *addr
+ 	*addr = new
+ 
+-	unlock()
++	unlock(addr)
+ 	return
+ }
+ 
+@@ -68,11 +73,11 @@
+ 
+ 	if (*addr) == old {
+ 		*addr = new
+-		unlock()
++		unlock(addr)
+ 		return true
+ 	}
+ 
+-	unlock()
++	unlock(addr)
+ 	return false
+ }
+ 
+@@ -82,7 +87,7 @@
+ 
+ 	val = *addr
+ 
+-	unlock()
++	unlock(addr)
+ 	return
+ }
+ 
+@@ -92,7 +97,7 @@
+ 
+ 	*addr = val
+ 
+-	unlock()
++	unlock(addr)
+ 	return
+ }
+ 
+--- a/src/internal/runtime/atomic/atomic_mipsx.s
++++ b/src/internal/runtime/atomic/atomic_mipsx.s
+@@ -310,10 +310,13 @@
+ TEXT ·Oruintptr(SB), NOSPLIT, $0-12
+ 	JMP	·Or32(SB)
+ 
++// spinLock/spinUnlock: one SYNC after acquiring (acquire) and one before the
++// releasing store (release). Every 64-bit access in between is thus fenced by a
++// full SYNC on both sides, as the 32-bit SYNC/LL-SC/SYNC atomics are; the leading
++// SYNC before LL and the trailing one after the unlock store added nothing to that.
+ TEXT ·spinLock(SB),NOSPLIT,$0-4
+ 	MOVW	state+0(FP), R1
+ 	MOVW	$1, R2
+-	SYNC
+ try_lock:
+ 	MOVW	R2, R3
+ check_again:
+@@ -328,5 +331,4 @@
+ 	MOVW	state+0(FP), R1
+ 	SYNC
+ 	MOVW	R0, (R1)
+-	SYNC
+ 	RET

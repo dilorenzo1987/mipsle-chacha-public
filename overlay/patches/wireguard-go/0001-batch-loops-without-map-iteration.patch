@@ -1,0 +1,169 @@
+--- a/device/receive.go
++++ b/device/receive.go
+@@ -100,6 +100,9 @@
+ 		count       int
+ 		deathSpiral int
+ 		elemsByPeer = make(map[*Peer]*QueueInboundElementsContainer, maxBatchSize)
++		// mipsle-chacha: peers in elemsByPeer, in insertion order; flushing walks this instead of
++		// iterating the map, whose cost scales with its capacity (maxBatchSize), not its size.
++		peersInBatch = make([]*Peer, 0, maxBatchSize)
+ 	)
+ 
+ 	defer func() {
+@@ -185,6 +188,7 @@
+ 				if !ok {
+ 					elemsForPeer = device.GetInboundElementsContainer()
+ 					elemsByPeer[peer] = elemsForPeer
++					peersInBatch = append(peersInBatch, peer)
+ 				}
+ 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
+ 				continue
+@@ -224,10 +228,12 @@
+ 				buf.decRef()
+ 			}
+ 		}
+-		for peer, elemsContainer := range elemsByPeer {
+-			peer.queueInboundIfRunning(elemsContainer)
++		for i, peer := range peersInBatch {
++			peer.queueInboundIfRunning(elemsByPeer[peer])
+ 			delete(elemsByPeer, peer)
++			peersInBatch[i] = nil
+ 		}
++		peersInBatch = peersInBatch[:0]
+ 	}
+ }
+ 
+--- a/device/send.go
++++ b/device/send.go
+@@ -326,6 +326,8 @@
+ 		readErr     error
+ 		elems       = make([]*QueueOutboundElement, batchSize)
+ 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
++		// mipsle-chacha: peers in elemsByPeer, in insertion order (see RoutineReceiveIncoming).
++		peersInBatch = make([]*Peer, 0, batchSize)
+ 		count       = 0
+ 	)
+ 
+@@ -423,16 +425,19 @@
+ 			if !ok {
+ 				elemsForPeer = device.GetOutboundElementsContainer()
+ 				elemsByPeer[peer] = elemsForPeer
++				peersInBatch = append(peersInBatch, peer)
+ 			}
+ 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
+ 			elems[i] = device.GetOutboundElement()
+ 		}
+ 
+-		for peer, elemsForPeer := range elemsByPeer {
+-			peer.StagePackets(elemsForPeer)
++		for i, peer := range peersInBatch {
++			peer.StagePackets(elemsByPeer[peer])
+ 			peer.SendStagedPackets()
+ 			delete(elemsByPeer, peer)
++			peersInBatch[i] = nil
+ 		}
++		peersInBatch = peersInBatch[:0]
+ 
+ 		if readErr != nil {
+ 			if errors.Is(readErr, tun.ErrTooManySegments) {
+--- a/tun/offload_linux.go
++++ b/tun/offload_linux.go
+@@ -155,12 +155,17 @@
+ type tcpGROTable struct {
+ 	itemsByFlow map[tcpFlowKey][]tcpGROItem
+ 	itemsPool   [][]tcpGROItem
++	// mipsle-chacha: keys of itemsByFlow in insertion order. reset and the coalesce accounting walk
++	// this instead of iterating the map, whose cost scales with its capacity (IdealBatchSize),
++	// not its size (usually 0-1 flows per write on the DERP path).
++	flows []tcpFlowKey
+ }
+ 
+ func newTCPGROTable() *tcpGROTable {
+ 	t := &tcpGROTable{
+ 		itemsByFlow: make(map[tcpFlowKey][]tcpGROItem, conn.IdealBatchSize),
+ 		itemsPool:   make([][]tcpGROItem, conn.IdealBatchSize),
++		flows:       make([]tcpFlowKey, 0, conn.IdealBatchSize),
+ 	}
+ 	for i := range t.itemsPool {
+ 		t.itemsPool[i] = make([]tcpGROItem, 0, conn.IdealBatchSize)
+@@ -211,6 +216,7 @@
+ 	items, ok := t.itemsByFlow[key]
+ 	if !ok {
+ 		items = t.newItems()
++		t.flows = append(t.flows, key)
+ 	}
+ 	items = append(items, item)
+ 	t.itemsByFlow[key] = items
+@@ -247,11 +253,11 @@
+ }
+ 
+ func (t *tcpGROTable) reset() {
+-	for k, items := range t.itemsByFlow {
+-		items = items[:0]
+-		t.itemsPool = append(t.itemsPool, items)
++	for _, k := range t.flows {
++		t.itemsPool = append(t.itemsPool, t.itemsByFlow[k][:0])
+ 		delete(t.itemsByFlow, k)
+ 	}
++	t.flows = t.flows[:0]
+ }
+ 
+ // udpFlowKey represents the key for a UDP flow.
+@@ -265,12 +271,14 @@
+ type udpGROTable struct {
+ 	itemsByFlow map[udpFlowKey][]udpGROItem
+ 	itemsPool   [][]udpGROItem
++	flows       []udpFlowKey // mipsle-chacha: see tcpGROTable.flows
+ }
+ 
+ func newUDPGROTable() *udpGROTable {
+ 	u := &udpGROTable{
+ 		itemsByFlow: make(map[udpFlowKey][]udpGROItem, conn.IdealBatchSize),
+ 		itemsPool:   make([][]udpGROItem, conn.IdealBatchSize),
++		flows:       make([]udpFlowKey, 0, conn.IdealBatchSize),
+ 	}
+ 	for i := range u.itemsPool {
+ 		u.itemsPool[i] = make([]udpGROItem, 0, conn.IdealBatchSize)
+@@ -318,6 +326,7 @@
+ 	items, ok := u.itemsByFlow[key]
+ 	if !ok {
+ 		items = u.newItems()
++		u.flows = append(u.flows, key)
+ 	}
+ 	items = append(items, item)
+ 	u.itemsByFlow[key] = items
+@@ -346,11 +355,11 @@
+ }
+ 
+ func (u *udpGROTable) reset() {
+-	for k, items := range u.itemsByFlow {
+-		items = items[:0]
+-		u.itemsPool = append(u.itemsPool, items)
++	for _, k := range u.flows {
++		u.itemsPool = append(u.itemsPool, u.itemsByFlow[k][:0])
+ 		delete(u.itemsByFlow, k)
+ 	}
++	u.flows = u.flows[:0]
+ }
+ 
+ // canCoalesce represents the outcome of checking if two TCP packets are
+@@ -687,7 +696,8 @@
+ // applyTCPCoalesceAccounting updates headers to account for coalescing based on the
+ // metadata found in table.
+ func applyTCPCoalesceAccounting(wi *groToWrite, table *tcpGROTable) error {
+-	for _, items := range table.itemsByFlow {
++	for _, k := range table.flows {
++		items := table.itemsByFlow[k]
+ 		for _, item := range items {
+ 			iov := wi.iovs[item.outputIdx]
+ 			pkt := iov[iovHeadPacketIdx]
+@@ -740,7 +750,8 @@
+ // applyUDPCoalesceAccounting updates headers to account for coalescing based on the
+ // metadata found in table.
+ func applyUDPCoalesceAccounting(wi *groToWrite, table *udpGROTable) error {
+-	for _, items := range table.itemsByFlow {
++	for _, k := range table.flows {
++		items := table.itemsByFlow[k]
+ 		for _, item := range items {
+ 			iov := wi.iovs[item.outputIdx]
+ 			pkt := iov[iovHeadPacketIdx]

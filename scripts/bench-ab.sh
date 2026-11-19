@@ -13,17 +13,20 @@
 #   --rounds R   rounds per run, median reported per run (default 3)
 #   --ms M       milliseconds per case and round (default 300)
 #   --filter S   only cases whose name contains S (e.g. "ccstream", "1420")
+#   --bench B    sweep (default: bench/sweep, warm micro-benchmark) or cold (bench/cold: every operation
+#                measured with the caches evicted first, next to the warm figure)
+#   --iters N    cold only: operations per case and run (default 300); --rounds/--ms are for sweep
 #
 # For each revision: a pristine golang.org/x/crypto (version as in
-# build-tailscaled.sh) from the module cache gets the overlay applied, and
-# bench/sweep is cross-compiled against it. Both binaries are copied to the
+# build-tailscaled.sh) from the module cache gets the overlay applied, and the
+# benchmark (bench/sweep or bench/cold) is cross-compiled against it. Both binaries are copied to the
 # device's /tmp (RAM), run alternately under the benchmark lock, then deleted.
 # The comparison (scripts/ab-compare.py) shows medians and, per case, in how
 # many pairs B was faster.
 #
-# Needs: device.env (ROUTER_SSH), .tools/go, python, and the module cache in
+# Needs: device.env (ROUTER_SSH), .tools/go, python3 (or python), and the module cache in
 # work/gopath (filled by build-tailscaled.sh or setup).
-# Output kept in work/ab/<A>_vs_<B>.txt.
+# Output kept in work/ab/<A>_vs_<B>.txt (cold: <A>_vs_<B>_cold.txt).
 
 set -euo pipefail
 
@@ -33,18 +36,19 @@ WORK="$ROOT/work"
 GO="$ROOT/.tools/go/bin/go"
 XCRYPTO_VERSION=$(sed -n 's/^XCRYPTO_VERSION=//p' "$SCRIPT_DIR/build-tailscaled.sh")
 
-PAIRS=6 ROUNDS=3 MS=300 FILTER=""
+PAIRS=6 ROUNDS=3 MS=300 FILTER="" BENCH=sweep ITERS=300
 die()  { printf 'bench-ab: ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '==> %s\n' "$*"; }
 
 POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --pairs)  PAIRS=$2; shift 2 ;;
-        --rounds) ROUNDS=$2; shift 2 ;;
-        --ms)     MS=$2; shift 2 ;;
-        --filter) FILTER=$2; shift 2 ;;
-        -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --pairs|--rounds|--ms|--iters)
+                  case "${2:-}" in ''|*[!0-9]*|0*) echo "$1 needs a positive integer" >&2; exit 2 ;; esac
+                  case "$1" in --pairs) PAIRS=$2 ;; --rounds) ROUNDS=$2 ;; --ms) MS=$2 ;; --iters) ITERS=$2 ;; esac; shift 2 ;;
+        --bench)  case "${2:-}" in sweep|cold) BENCH=$2 ;; *) echo "--bench needs sweep or cold" >&2; exit 2 ;; esac; shift 2 ;;
+        --filter) [ $# -ge 2 ] || { echo "--filter needs a value" >&2; exit 2; }; FILTER=$2; shift 2 ;;
+        -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *)  POS+=("$1"); shift ;;
     esac
@@ -64,7 +68,7 @@ export GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0
 ssh_dev() { ssh -o BatchMode=yes "$ROUTER_SSH" "$@" 2> >(grep -v -i 'post-quantum\|store now, decrypt later\|openssh.com/pq\|upgraded' >&2); }
 safe() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
-# prepare <rev> <label>: overlay copy, patched x/crypto, sweep binary in work/ab/<label>/
+# prepare <rev> <label>: overlay copy, patched x/crypto, benchmark binary in work/ab/<label>/
 prepare() {
     local rev=$1 label=$2 dir="$WORK/ab/$2"
     rm -rf "$dir" && mkdir -p "$dir/overlay" "$dir/bench"
@@ -75,8 +79,9 @@ prepare() {
         git -C "$ROOT" archive "$rev" overlay | tar -x -C "$dir"
     fi
     cp -r "$XC_SRC" "$dir/xc" && chmod -R u+w "$dir/xc"
-    "$SCRIPT_DIR/apply-overlay.sh" --overlay-dir "$dir/overlay" "$dir/xc" - >/dev/null
-    cp "$ROOT/bench/sweep/main.go" "$dir/bench/"
+    bash "$SCRIPT_DIR/apply-overlay.sh" --overlay-dir "$dir/overlay" "$dir/xc" - >/dev/null
+    cp "$ROOT/bench/$BENCH"/*.go "$dir/bench/"
+    cp "$ROOT/bench/$BENCH"/*.s "$dir/bench/" 2>/dev/null || true
     cat >"$dir/bench/go.mod" <<EOF
 module sweep
 
@@ -97,14 +102,16 @@ prepare "${POS[0]}" "$A"
 prepare "${POS[1]}" "$B"
 
 OUT="$WORK/ab/${A}_vs_${B}.txt"
-ssh_dev 'mkdir /tmp/mc.lock' || die "benchmark lock /tmp/mc.lock is held on the device"
+[ "$BENCH" = sweep ] || OUT="$WORK/ab/${A}_vs_${B}_$BENCH.txt"
+ssh_dev 'mkdir /tmp/mc.lock' || die "benchmark lock /tmp/mc.lock is held on the device (or the device is unreachable)"
 cleanup() { ssh_dev "rm -f /tmp/ab-A /tmp/ab-B /tmp/ab.txt; rmdir /tmp/mc.lock" || true; }
 trap cleanup EXIT
 gzip -c "$WORK/ab/$A/sweep" | ssh_dev 'gunzip -c > /tmp/ab-A && chmod +x /tmp/ab-A'
 gzip -c "$WORK/ab/$B/sweep" | ssh_dev 'gunzip -c > /tmp/ab-B && chmod +x /tmp/ab-B'
-note "running $PAIRS interleaved pairs on the device (rounds=$ROUNDS, ms=$MS, filter='$FILTER')"
+if [ "$BENCH" = cold ]; then RUNARGS="$ITERS '$FILTER'"; note "running $PAIRS interleaved pairs on the device (cold, iterations=$ITERS, filter='$FILTER')"
+else RUNARGS="$ROUNDS $MS '$FILTER'"; note "running $PAIRS interleaved pairs on the device (rounds=$ROUNDS, ms=$MS, filter='$FILTER')"; fi
 ssh_dev "cd /tmp && : > ab.txt && i=0 && while [ \$i -lt $PAIRS ]; do i=\$((i+1)); \
-  echo '## $A' \$i >> ab.txt; ./ab-A $ROUNDS $MS '$FILTER' >> ab.txt 2>&1; \
-  echo '## $B' \$i >> ab.txt; ./ab-B $ROUNDS $MS '$FILTER' >> ab.txt 2>&1; done; cat ab.txt" >"$OUT"
-python "$SCRIPT_DIR/ab-compare.py" "$OUT" "$A" "$B"
+  echo '## $A' \$i >> ab.txt; ./ab-A $RUNARGS >> ab.txt 2>&1; \
+  echo '## $B' \$i >> ab.txt; ./ab-B $RUNARGS >> ab.txt 2>&1; done; cat ab.txt" >"$OUT"
+"$(command -v python3 || command -v python)" "$SCRIPT_DIR/ab-compare.py" "$OUT" "$A" "$B"
 note "raw output: $OUT"
