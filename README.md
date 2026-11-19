@@ -7,18 +7,20 @@ Hobby project.
 ## Summary
 
 Tailscale encrypts all traffic with ChaCha20-Poly1305. For the router's MIPS processor, Go only has slow generic
-code for it, and that limited the VPN speed. This repository replaces that code with assembly written for this
-processor and rebuilds the community "tiny" Tailscale build for the router with it. Two further steps then made
-the rest of the work per packet cheaper.
+code for it, and that limited Tailscale's throughput. This repository replaces that code with assembly written
+for this processor and rebuilds the community "tiny" Tailscale build for the router with it. Two further steps
+then made the rest of the work per packet cheaper.
 
-Measured on one Mango 2:
+Tailscale throughput on one Mango 2:
 
-| | Stock community build | With this project | Gain |
+| Tailscale build on the router | Through a relay server (DERP) | Direct connection, download | Direct connection, upload |
 |---|---|---|---|
-| VPN download through a Tailscale relay server (DERP) | 7.2 Mbit/s | 14.0 Mbit/s | about 2x (1) |
-| VPN download over a direct connection | 18.1 Mbit/s | 21.5 Mbit/s (2) | +19 % |
-| VPN upload over a direct connection | 14.7 Mbit/s | 17.9 Mbit/s (2) | +22 % |
-| Encryption alone, one processor core | 49 Mbit/s | 286 Mbit/s | 5.8x (3) |
+| GL.iNet's stock binary (Tailscale 1.92.5, firmware 4.10.1) | about 3-4 Mbit/s (1) | not measured | not measured |
+| Community "tiny" build by admonstrator (Tailscale 1.104.7), unpacked (2) | 7.2 Mbit/s | 18.1 Mbit/s | 14.7 Mbit/s |
+| This project (same Tailscale version and feature set) | 14.0 Mbit/s (3) | 21.5 Mbit/s (4) | 17.9 Mbit/s (4) |
+
+Through a relay this is about twice the throughput of the community build it is based on. Encryption alone, on
+one processor core: 49 Mbit/s with Go's generic code, 286 Mbit/s with the assembly (5).
 
 How it got there:
 
@@ -39,13 +41,20 @@ a separate automated review, but there has been no human or third-party audit of
 
 Notes on the table:
 
-- (1) The two values were measured three days apart with different download servers, so the factor is
+- (1) The author's observation with the Tailscale binary that firmware 4.10.1 ships. It is not part of the
+  measurement sessions in `results/` and was not taken under the same conditions as the other rows.
+- (2) As released, the community build is compressed with UPX. On this router (128 MB RAM) that currently fails
+  by default: during boot the kernel's out-of-memory killer ends tailscaled (the author's observation, November
+  2026). A UPX-packed binary holds its whole unpacked image in memory, while an unpacked binary is paged in from
+  flash on demand. The author therefore ran the build unpacked (`upx -d`); the values in this row are from that
+  unpacked binary, and the builds from this repository are not compressed.
+- (3) The 7.2 and the 14.0 were measured three days apart with different download servers, so the factor is
   approximate. The steps in between were each measured back to back within one session (+56 %, +9 %, +4 %,
   +15 %) and multiply to the same factor. The last step comes from a single session; its size is uncertain by
   about 5 percentage points.
-- (2) Measured with the first version in an A/B against the stock build. A short check of the current build
+- (4) Measured with the first version in an A/B against the community build. A short check of the current build
   gave about 23 Mbit/s down and 20-21 up (2026-11-19, two runs each, not an A/B).
-- (3) Warm micro-benchmark with 1420-byte packets, both measured back to back on 2026-11-19.
+- (5) Warm micro-benchmark with 1420-byte packets, both measured back to back on 2026-11-19.
 
 In technical terms: MIPS32 little-endian (softfloat) assembly for ChaCha20, Poly1305 and the combined AEAD, and a
 reproducible pipeline that builds Tailscale's `tailscaled` with it for a GL.iNet GL-MG1300 router.
@@ -96,7 +105,7 @@ time). This project:
 
 ## The reference: admonstrator's tiny build
 
-The reference is `1.104.7-tiny.by.admon.1457` (the build the router ran before this project) from
+The reference is `1.104.7-tiny.by.admon.1457` (the build the router ran before this project, unpacked) from
 [admonstrator/glinet-tailscale-updater](https://github.com/admonstrator/glinet-tailscale-updater).
 Its workflow (`.github/workflows/build-tailscale.yaml`):
 
@@ -114,7 +123,9 @@ Its workflow (`.github/workflows/build-tailscale.yaml`):
   `-ldflags "-w -s -X tailscale.com/version.longStamp=… -X tailscale.com/version.shortStamp=…"`;
 - builds with `CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath`;
 - compresses the binary with `upx --lzma --best` for release. This pipeline does not
-  use UPX; the outputs are unpacked.
+  use UPX; the outputs are unpacked. (On the Mango 2 the compressed release currently fails by default: during
+  boot the kernel's out-of-memory killer ends tailscaled, see note 2 in the Summary. All measurements of the
+  tiny build in this repository used the unpacked binary.)
 
 `scripts/build-tailscaled.sh` reproduces these steps. It pins admon's repo at
 `e5aa293`, its HEAD when 1.104.7 was built, and runs admon's own patch script, which
@@ -266,7 +277,8 @@ reachable only through a custom DERP relay, where each packet is encrypted twice
 
 | Step | Relay download | CPU time per MB | Measured as |
 |---|---|---|---|
-| Stock tiny build (admonstrator) | 7.2 Mbit/s | | |
+| GL.iNet's stock binary (Tailscale 1.92.5, firmware 4.10.1) | about 3-4 Mbit/s | | the author's observation, not measured in these sessions |
+| Community tiny build (admonstrator), unpacked | 7.2 Mbit/s | | |
 | ChaCha20 and Poly1305 in assembly (2026-11-16) | 11.2 Mbit/s, +56 % | | A/B, 2 runs each |
 | Tuning pass of the assembly, PGO (2026-11-16/17) | within the run-to-run spread | about 0-1 % | interleaved segments |
 | 3 Go threads, lock striping (2026-11-17) | +8.8 % | -7.4 % | blocks of plain restarts, replicated |
@@ -277,7 +289,7 @@ reachable only through a custom DERP relay, where each packet is encrypted twice
 Absolute values differ between sessions (the download server changed on 2026-11-19, and the cost per MB varies from
 one process start to the next), so each step is given relative to the build before it, measured in the same session.
 
-Direct connection (exit node over direct UDP), A/B of the first version against the stock build: download
+Direct connection (exit node over direct UDP), A/B of the first version against the community build: download
 18.1 -> 21.5 Mbit/s (+19 %), upload 14.7 -> 17.9 Mbit/s (+22 %). The later steps were not A/B-tested on the direct
 path; a short check of the current build gave about 23 Mbit/s down and 20-21 up.
 

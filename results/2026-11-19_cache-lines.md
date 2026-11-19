@@ -169,9 +169,11 @@ neighbouring block pairs, but only 4 of 8 restarts below the other build's media
 in place (per-frame `SetReadDeadline` 1.45 % of the CPU -> gone, map iteration in wireguard-go's batch loops
 3.32 % -> 0.22 %).
 
-From the stock build to `.6`, relay download: 7.2 Mbit/s (2026-11-16) -> 14.0 Mbit/s (2026-11-19). The two
-values come from different days and different download servers; the steps in between were each measured within
-one session (+56 %, +8.8 %, +3.7 %, +15 %) and multiply to a factor of 2.0.
+From the community tiny build (unpacked) to `.6`, relay download: 7.2 Mbit/s (2026-11-16) -> 14.0 Mbit/s
+(2026-11-19). The two values come from different days and different download servers; the steps in between were
+each measured within one session (+56 %, +8.8 %, +3.7 %, +15 %) and multiply to a factor of 2.0. For orientation:
+GL.iNet's stock Tailscale binary (1.92.5, firmware 4.10.1) reached about 3-4 Mbit/s through a relay in the
+author's use; that was not measured in these sessions.
 
 ## 7. Reproduce
 
